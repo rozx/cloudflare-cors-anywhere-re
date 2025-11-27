@@ -69,8 +69,64 @@ The `wrangler.toml` file contains the basic configuration:
 -   `name`: Your worker name (currently "cloudflare-cors-anywhere")
 -   `main`: Entry point file (index.js)
 -   `compatibility_date`: Cloudflare Workers API version
+-   `observability`: Logging configuration (enabled by default with 100% sampling rate)
 
-You can customize the worker name in `wrangler.toml` if desired.
+You can customize the worker name in `wrangler.toml` if desired. The observability section enables free logging with:
+- **Free Tier**: 200,000 log events per day with 3-day retention
+- **Sampling Rate**: 100% (all requests are logged)
+
+#### Whitelist and Blacklist Configuration
+
+You can configure URL blacklists and origin whitelists using **Cloudflare Secrets** (recommended) or environment variables.
+
+**Using Cloudflare Secrets (Recommended):**
+
+Secrets are secure, encrypted, and not stored in your codebase. Set them using the Wrangler CLI:
+
+```bash
+# Set blacklist URLs (JSON array of regex patterns)
+wrangler secret put BLACKLIST_URLS
+# When prompted, paste: ["^https?://malicious\\.com", "^https?://.*\\.spam\\.com"]
+
+# Set whitelist origins (JSON array of regex patterns)
+wrangler secret put WHITELIST_ORIGINS
+# When prompted, paste: ["^https://example\\.com$", "^https://.*\\.example\\.com$"]
+```
+
+**View/Update Secrets:**
+
+```bash
+# View list of all secrets (names only, not values)
+wrangler secret list
+
+# Update a secret
+wrangler secret put BLACKLIST_URLS
+
+# Delete a secret
+wrangler secret delete BLACKLIST_URLS
+```
+
+**Configuration Format:**
+
+- **BLACKLIST_URLS**: JSON array of regex patterns for URLs to block
+  - Example: `["^https?://malicious\\.com", "^https?://.*\\.phishing\\.net"]`
+  - Empty array `[]` means no URLs are blacklisted (default)
+
+- **WHITELIST_ORIGINS**: JSON array of regex patterns for allowed origins
+  - Example: `["^https://myapp\\.com$", "^https://.*\\.myapp\\.com$"]`
+  - Default: `[".*"]` (all origins allowed)
+
+**Alternative: Environment Variables (wrangler.toml)**
+
+For non-sensitive configuration, you can use the `[vars]` section in `wrangler.toml`:
+
+```toml
+[vars]
+BLACKLIST_URLS = '["^https?://malicious\\.com"]'
+WHITELIST_ORIGINS = '["^https://example\\.com$"]'
+```
+
+**Note:** Secrets take precedence over `[vars]` if both are set.
 
 ### Deploy to Cloudflare
 
@@ -128,6 +184,59 @@ To update your worker after making changes:
 
 ```bash
 wrangler deploy
+```
+
+### Logging
+
+This project includes comprehensive logging that is **completely free** using Cloudflare Workers' built-in console logging. Logging is enabled in `wrangler.toml` via the `observability` section, which is configured to log 100% of requests.
+
+#### View Real-Time Logs
+
+Use Wrangler's tail command to view real-time logs from your deployed worker:
+
+```bash
+npm run logs
+```
+
+Or view logs in JSON format:
+
+```bash
+npm run logs:json
+```
+
+#### What Gets Logged
+
+The worker logs the following information:
+
+- **Request Information**: Method, path, origin, IP address, country, datacenter location
+- **Target URLs**: All proxy requests with target URLs
+- **Success Logs**: Successful requests with status codes and response times
+- **Error Logs**: Failed requests with detailed error messages and stack traces
+- **Info Requests**: When users access the info page
+- **Blocked Requests**: When requests are blocked by whitelist/blacklist rules
+
+#### View Logs in Cloudflare Dashboard
+
+1. Go to [Cloudflare Dashboard](https://dash.cloudflare.com/)
+2. Navigate to **Workers & Pages**
+3. Select your worker
+4. Click on **Logs** tab to view historical logs
+
+**Note**: Logs are available for free in the Cloudflare Dashboard. Real-time logs via `wrangler tail` are also free and show logs as they happen.
+
+#### Log Format
+
+Logs include timestamps (ISO format), emojis for easy visual scanning:
+- ✅ Success
+- ❌ Error
+- ⚠️ Warning
+- ℹ️ Info
+
+Example log output:
+```
+[2024-01-15T10:30:45.123Z] GET /?url=https://api.example.com/data | Origin: https://example.com | IP: 192.168.1.1 | Country: US | Colo: LAX
+[2024-01-15T10:30:45.456Z] Fetching target URL: https://api.example.com/data
+[2024-01-15T10:30:45.789Z] ✅ Success: https://api.example.com/data | Status: 200 | Duration: 333ms | Method: GET
 ```
 
 ### Troubleshooting

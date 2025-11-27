@@ -3,3 +3,29 @@ main = "index.js"
 compatibility_date = "2024-11-01"
 workers_dev = false
 preview_urls = false
+
+# Enable logging/observability (free tier: 200,000 log events/day with 3-day retention)
+[observability]
+enabled = true
+head_sampling_rate = 1 # 100% of requests are logged (1 = 100%)
+
+# Configuration using Cloudflare Secrets (recommended)
+# Set these using: wrangler secret put <NAME>
+# 
+# Required format: JSON arrays of regex patterns
+# Example:
+#   wrangler secret put BLACKLIST_URLS
+#   # Then paste: ["^https?://malicious\\.com", "^https?://.*\\.spam\\.com"]
+#
+#   wrangler secret put WHITELIST_ORIGINS
+#   # Then paste: ["^https://example\\.com$", "^https://.*\\.example\\.com$"]
+#
+# Alternative: Use [vars] section below for non-sensitive config (not recommended for production)
+
+# [vars]
+# BLACKLIST_URLS = '["^https?://malicious\\.com"]'
+# WHITELIST_ORIGINS = '["^https://example\\.com$"]'
+
+[vars]
+BLACKLIST_URLS = '[]'
+WHITELIST_ORIGINS = '["^.*$"]'
