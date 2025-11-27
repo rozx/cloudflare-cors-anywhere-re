@@ -1,22 +1,32 @@
 {
-    "name": "{{ project-name }}",
-    "version": "1.0.0",
-    "description": "A CORS proxy running in a worker",
+    "name": "cloudflare-cors-anywhere",
+    "version": "1.1.0",
+    "description": "A CORS proxy running as a Cloudflare Worker",
     "main": "index.js",
     "scripts": {
         "test": "echo \"Error: no test specified\" && exit 1",
-        "format": "prettier --write '**/*.{js,css,json,md}'"
+        "deploy": "wrangler deploy"
     },
-    "author": "{{ authors }}",
+    "keywords": [
+        "cors",
+        "proxy",
+        "cloudflare",
+        "worker",
+        "cloudflare-workers"
+    ],
+    "author": "rozx",
     "license": "MIT",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/rozx/cloudflare-cors-anywhere.git"
+    },
+    "bugs": {
+        "url": "https://github.com/rozx/cloudflare-cors-anywhere/issues"
+    },
+    "homepage": "https://github.com/rozx/cloudflare-cors-anywhere#readme",
     "devDependencies": {
         "husky": "^2.1.0",
-        "prettier": "^1.17.0"
-    },
-    "husky": {
-        "hooks": {
-            "pre-commit": "npm run format",
-            "pre-push": "npm run format"
-        }
+        "prettier": "^1.17.0",
+        "wrangler": "^4.51.0"
     }
 }
