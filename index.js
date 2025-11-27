@@ -171,6 +171,78 @@ function isListedInWhitelist(uri, listing) {
     return true;
 }
 
+/**
+ * Check if a response should be streamed instead of buffered
+ * Detects Server-Sent Events (SSE), chunked transfer encoding, and streaming content types
+ * Supports AI model streaming APIs (OpenAI, Anthropic, etc.)
+ *
+ * @param {Response} response - The response to check
+ * @param {Request} request - The original request (to check Accept headers and URL)
+ * @param {string} targetUrl - The target URL being proxied (to check for streaming parameters)
+ * @returns {boolean} - True if the response should be streamed
+ */
+function shouldStreamResponse(response, request, targetUrl) {
+    // Skip streaming for preflight requests
+    if (request.method === "OPTIONS") {
+        return false;
+    }
+
+    const contentType = response.headers.get("content-type") || "";
+    const transferEncoding = response.headers.get("transfer-encoding") || "";
+    const acceptHeader = request.headers.get("accept") || "";
+
+    // Check for Server-Sent Events (SSE) - common for AI streaming APIs
+    if (contentType.includes("text/event-stream")) {
+        return true;
+    }
+
+    // Check for chunked transfer encoding
+    if (transferEncoding.toLowerCase().includes("chunked")) {
+        return true;
+    }
+
+    // Check if client requested streaming (text/event-stream or streaming indicators)
+    if (acceptHeader.includes("text/event-stream")) {
+        return true;
+    }
+
+    // Check URL for streaming parameters (common in AI APIs)
+    if (targetUrl) {
+        try {
+            const url = new URL(targetUrl);
+            const streamParam = url.searchParams.get("stream");
+            if (streamParam === "true" || streamParam === "1") {
+                return true;
+            }
+        } catch (e) {
+            // If URL parsing fails, continue with other checks
+        }
+    }
+
+    // Check request body for streaming flags (for POST requests with JSON body)
+    // Note: This is a heuristic - we can't read the body without consuming it,
+    // so we check common patterns in headers
+    const contentEncoding = response.headers.get("content-encoding") || "";
+    if (contentEncoding.includes("chunked")) {
+        return true;
+    }
+
+    // Check for common AI streaming API content types
+    // OpenAI streaming: text/plain or text/event-stream
+    // Anthropic streaming: text/event-stream or application/x-ndjson
+    // Other APIs may use application/json with chunked encoding
+    if (contentType.includes("application/x-ndjson")) {
+        return true;
+    }
+
+    // If content-type is text/plain and we have chunked encoding, likely streaming
+    if (contentType.includes("text/plain") && transferEncoding.toLowerCase().includes("chunked")) {
+        return true;
+    }
+
+    return false;
+}
+
 // Module worker export - handles all incoming fetch requests
 export default {
     async fetch(request, env, ctx) {
@@ -541,30 +613,69 @@ export default {
                 responseHeaders.set("Access-Control-Expose-Headers", exposedHeaders.join(","));
                 responseHeaders.set("cors-received-headers", JSON.stringify(allResponseHeaders));
 
-                const responseBody = isPreflightRequest ? null : await response.arrayBuffer();
+                // Check if this is a streaming response (for AI model streaming, SSE, etc.)
+                const isStreaming = shouldStreamResponse(response, request, targetUrl);
+
+                // For streaming responses, pass through the stream directly
+                // For non-streaming, buffer the response as before for backward compatibility
+                let responseBody;
+                if (isPreflightRequest) {
+                    responseBody = null;
+                } else if (isStreaming) {
+                    // Pass through the stream directly - don't buffer
+                    // This allows Server-Sent Events and chunked streaming to work properly
+                    responseBody = response.body;
+                    console.log(
+                        `[${new Date().toISOString()}] 📡 Streaming response detected: ${targetUrl} | Content-Type: ${responseHeaders.get(
+                            "content-type"
+                        ) || "unknown"}`
+                    );
+                } else {
+                    // Buffer the response for non-streaming responses
+                    responseBody = await response.arrayBuffer();
+                }
+
                 const duration = Date.now() - startTime;
 
                 // Log success or error based on status code
-                if (response.status >= 200 && response.status < 300) {
-                    console.log(
-                        `[${new Date().toISOString()}] ✅ Success: ${targetUrl} | Status: ${
-                            response.status
-                        } | Duration: ${duration}ms | Method: ${request.method}`
-                    );
-                } else if (response.status >= 400) {
-                    console.warn(
-                        `[${new Date().toISOString()}] ⚠️  HTTP Error: ${targetUrl} | Status: ${
-                            response.status
-                        } ${response.statusText} | Duration: ${duration}ms | Method: ${
-                            request.method
-                        }`
-                    );
+                // For streaming responses, log immediately (can't wait for completion)
+                if (isStreaming) {
+                    if (response.status >= 200 && response.status < 300) {
+                        console.log(
+                            `[${new Date().toISOString()}] ✅ Streaming started: ${targetUrl} | Status: ${
+                                response.status
+                            } | Method: ${request.method}`
+                        );
+                    } else if (response.status >= 400) {
+                        console.warn(
+                            `[${new Date().toISOString()}] ⚠️  Streaming error: ${targetUrl} | Status: ${
+                                response.status
+                            } ${response.statusText} | Method: ${request.method}`
+                        );
+                    }
                 } else {
-                    console.log(
-                        `[${new Date().toISOString()}] ℹ️  Response: ${targetUrl} | Status: ${
-                            response.status
-                        } | Duration: ${duration}ms | Method: ${request.method}`
-                    );
+                    // Non-streaming: log after buffering is complete
+                    if (response.status >= 200 && response.status < 300) {
+                        console.log(
+                            `[${new Date().toISOString()}] ✅ Success: ${targetUrl} | Status: ${
+                                response.status
+                            } | Duration: ${duration}ms | Method: ${request.method}`
+                        );
+                    } else if (response.status >= 400) {
+                        console.warn(
+                            `[${new Date().toISOString()}] ⚠️  HTTP Error: ${targetUrl} | Status: ${
+                                response.status
+                            } ${response.statusText} | Duration: ${duration}ms | Method: ${
+                                request.method
+                            }`
+                        );
+                    } else {
+                        console.log(
+                            `[${new Date().toISOString()}] ℹ️  Response: ${targetUrl} | Status: ${
+                                response.status
+                            } | Duration: ${duration}ms | Method: ${request.method}`
+                        );
+                    }
                 }
 
                 return new Response(responseBody, {
