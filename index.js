@@ -377,6 +377,30 @@ async function setPreferredBackupServer(env, targetUrl, backupCorsServer) {
     }
 }
 
+async function clearPreferredBackupServer(env, targetUrl, reason = "") {
+    try {
+        const backupServerCache = env?.BACKUP_SERVER_CACHE;
+        if (!backupServerCache || typeof backupServerCache.delete !== "function") {
+            return;
+        }
+
+        const cacheKey = buildPreferredBackupCacheKey(targetUrl);
+        await backupServerCache.delete(cacheKey);
+
+        console.log(
+            `[${new Date().toISOString()}] 🧹 Cleared preferred backup cache for ${targetUrl}${
+                reason ? ` | Reason: ${reason}` : ""
+            }`
+        );
+    } catch (error) {
+        console.warn(
+            `[${new Date().toISOString()}] ⚠️  Failed to clear preferred backup cache for ${targetUrl}: ${
+                error.message
+            }`
+        );
+    }
+}
+
 // Bot Detection Note:
 // Some sites (like Google) use advanced bot detection that may block Cloudflare Workers requests.
 // This is due to: IP reputation (data center IPs), TLS fingerprinting, inability to execute
@@ -826,9 +850,9 @@ export default {
             let prioritizedBackupServers = [...filteredBackupServers];
             let preferredBackupCacheHit = false;
             let preferredBackupServer = null;
-            if (prioritizedBackupServers.length > 0) {
-                preferredBackupServer = await getPreferredBackupServer(env, targetUrl);
-                if (preferredBackupServer && prioritizedBackupServers.includes(preferredBackupServer)) {
+            preferredBackupServer = await getPreferredBackupServer(env, targetUrl);
+            if (preferredBackupServer) {
+                if (prioritizedBackupServers.includes(preferredBackupServer)) {
                     const preferredIndex = prioritizedBackupServers.indexOf(preferredBackupServer);
                     prioritizedBackupServers.splice(preferredIndex, 1);
                     prioritizedBackupServers.unshift(preferredBackupServer);
@@ -837,16 +861,42 @@ export default {
                     console.log(
                         `[${new Date().toISOString()}] ⭐ Preferred backup server hit: ${preferredBackupServer} | TTL: ${PREFERRED_BACKUP_TTL_SECONDS}s`
                     );
+                } else {
+                    ctx.waitUntil(
+                        clearPreferredBackupServer(
+                            env,
+                            targetUrl,
+                            "cached server is no longer in BACKUP_CORS_SERVERS"
+                        )
+                    );
+                    preferredBackupServer = null;
                 }
             }
 
             if (prioritizedBackupServers.length > 1) {
-                const rotationStartIndex = getNextBackupRotationStart(prioritizedBackupServers.length);
-                prioritizedBackupServers = rotateArray(prioritizedBackupServers, rotationStartIndex);
+                if (preferredBackupCacheHit) {
+                    const pinnedPreferredServer = prioritizedBackupServers[0];
+                    const nonPreferredServers = prioritizedBackupServers.slice(1);
 
-                console.log(
-                    `[${new Date().toISOString()}] 🔄 Rotating backup servers (start index: ${rotationStartIndex}) for ${targetUrl}`
-                );
+                    if (nonPreferredServers.length > 1) {
+                        const rotationStartIndex = getNextBackupRotationStart(nonPreferredServers.length);
+                        prioritizedBackupServers = [
+                            pinnedPreferredServer,
+                            ...rotateArray(nonPreferredServers, rotationStartIndex)
+                        ];
+
+                        console.log(
+                            `[${new Date().toISOString()}] 🔄 Rotating non-preferred backup servers (start index: ${rotationStartIndex}) for ${targetUrl} | Preferred pinned: ${pinnedPreferredServer}`
+                        );
+                    }
+                } else {
+                    const rotationStartIndex = getNextBackupRotationStart(prioritizedBackupServers.length);
+                    prioritizedBackupServers = rotateArray(prioritizedBackupServers, rotationStartIndex);
+
+                    console.log(
+                        `[${new Date().toISOString()}] 🔄 Rotating backup servers (start index: ${rotationStartIndex}) for ${targetUrl}`
+                    );
+                }
             }
 
             const attemptTargets = [
@@ -949,6 +999,16 @@ export default {
                                     currentAttemptTarget.backupServer
                                 } | Error: ${error.message}`
                             );
+
+                            if (currentAttemptTarget.preferred) {
+                                ctx.waitUntil(
+                                    clearPreferredBackupServer(
+                                        env,
+                                        targetUrl,
+                                        `preferred backup server network failure (${error.message})`
+                                    )
+                                );
+                            }
                         }
 
                         if (!isLastAttempt) {
@@ -971,6 +1031,16 @@ export default {
                                     currentAttemptTarget.backupServer
                                 } | Status: ${response.status} | Trying next server...`
                             );
+
+                            if (currentAttemptTarget.preferred) {
+                                ctx.waitUntil(
+                                    clearPreferredBackupServer(
+                                        env,
+                                        targetUrl,
+                                        `preferred backup server returned retryable status ${response.status}`
+                                    )
+                                );
+                            }
                         }
 
                         console.warn(
@@ -1152,7 +1222,7 @@ export default {
                 "Backup:",
                 "BACKUP_CORS_SERVERS must contain {url} placeholder",
                 "Retryable statuses: all 4xx + 502 + 503",
-                "Backup servers rotate each request to spread load",
+                "Backup servers rotate each request (preferred stays first, others rotate)",
                 "Successful backup is cached as preferred for 15 minutes (KV)",
                 "Sensitive headers block backup by default (override with allowSensitive=true)",
                 "",

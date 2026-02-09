@@ -150,6 +150,7 @@ wrangler secret delete BLACKLIST_URLS
     - Quoted list: `"https://a/?url={url}","https://b/?url={url}"`
     - Comma/newline-separated URLs
   - Smart routing: when a backup server succeeds, worker stores it in KV for 15 minutes per target URL and prioritizes it first during that window
+  - Auto cleanup: stale preferred entries are deleted when the cached server is removed from `BACKUP_CORS_SERVERS` or when that preferred server fails (network error / retryable status)
   - Used when direct destination fetch fails or returns retryable status (all `4xx` + `502`/`503`)
   - Default: `[]` (disabled)
   - Legacy compatibility: `DEFAULT_BACKUP_CORS_SERVERS` is also accepted, but deprecated
