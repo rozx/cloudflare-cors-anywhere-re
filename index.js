@@ -867,8 +867,11 @@ export default {
                 );
             }
 
-            // MAX_RETRY_ATTEMPTS means retry count after initial attempt
-            const maxTotalAttempts = Math.max(1, config.maxRetryAttempts + 1);
+            // MAX_RETRY_ATTEMPTS means retry count after initial attempt.
+            // Ensure we still try every backup server at least once before giving up,
+            // otherwise a small retry value could fail early without reaching next backup.
+            const configuredMaxAttempts = Math.max(1, config.maxRetryAttempts + 1);
+            const maxTotalAttempts = Math.max(configuredMaxAttempts, attemptTargets.length);
 
             const createAttemptRequest = attemptUrl =>
                 new Request(attemptUrl, {
