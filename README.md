@@ -108,9 +108,9 @@ wrangler secret put BLACKLIST_URLS
 wrangler secret put WHITELIST_ORIGINS
 # When prompted, paste: ["^https://example\\.com$", "^https://.*\\.example\\.com$"]
 
-# Set backup CORS servers (JSON array of backup proxy URLs)
+# Set backup CORS servers (JSON array of backup proxy URLs/config objects)
 wrangler secret put BACKUP_CORS_SERVERS
-# When prompted, paste: ["https://backup-1.workers.dev", "https://backup-2.workers.dev"]
+# When prompted, paste: [{"url":"https://backup-1.workers.dev/?url={url}","headers":{"x-cors-api-key":"temp_cf7e8e6dd6b319e39385f2f9396804aa"}},"https://backup-2.workers.dev/?url={url}"]
 
 # Set retry attempts after first try (non-negative integer)
 wrangler secret put MAX_RETRY_ATTEMPTS
@@ -140,16 +140,18 @@ wrangler secret delete BLACKLIST_URLS
   - Example: `["^https://myapp\\.com$", "^https://.*\\.myapp\\.com$"]`
   - Default: `[".*"]` (all origins allowed)
 
-- **BACKUP_CORS_SERVERS**: JSON array of backup CORS proxy server URLs
+- **BACKUP_CORS_SERVERS**: JSON array of backup CORS proxy server URL templates or config objects
   - Format: backup URL template must include `{url}` placeholder
-  - Example: `"https://backup.server.com/?url={url}"`
+  - String example: `"https://backup.server.com/?url={url}"`
+  - Object example (with backup-specific headers): `{"url":"https://backup.server.com/?url={url}","headers":{"x-cors-api-key":"temp_cf7e8e6dd6b319e39385f2f9396804aa"}}`
+  - Header behavior: object `headers` apply only when routing through that backup server
   - Also supports URL-encoded placeholder form: `%7Burl%7D`
   - Runtime behavior: worker replaces `{url}` with the actual target URL
   - Accepted input formats:
-    - JSON array (recommended): `["https://a/?url={url}","https://b/?url={url}"]`
+    - JSON array (recommended): `["https://a/?url={url}",{"url":"https://b/?url={url}","headers":{"x-cors-api-key":"token"}}]`
     - Quoted list: `"https://a/?url={url}","https://b/?url={url}"`
     - Comma/newline-separated URLs
-  - Smart routing: when a backup server succeeds, worker stores it in KV for 15 minutes per target URL and prioritizes it first during that window
+  - Smart routing: when a backup server succeeds, worker stores it in KV for 15 minutes per target domain and prioritizes it first during that window
   - Auto cleanup: stale preferred entries are deleted when the cached server is removed from `BACKUP_CORS_SERVERS` or when that preferred server fails (network error / retryable status)
   - Used when direct destination fetch fails or returns retryable status (all `4xx` + `502`/`503`)
   - Default: `[]` (disabled)
@@ -167,7 +169,7 @@ For non-sensitive configuration, you can use the `[vars]` section in `wrangler.t
 [vars]
 BLACKLIST_URLS = '["^https?://malicious\\.com"]'
 WHITELIST_ORIGINS = '["^https://example\\.com$"]'
-BACKUP_CORS_SERVERS = '["https://backup-1.workers.dev", "https://backup-2.workers.dev"]'
+BACKUP_CORS_SERVERS = '[{"url":"https://backup-1.workers.dev/?url={url}","headers":{"x-cors-api-key":"temp_cf7e8e6dd6b319e39385f2f9396804aa"}},"https://backup-2.workers.dev/?url={url}"]'
 MAX_RETRY_ATTEMPTS = '3'
 ```
 

@@ -17,7 +17,6 @@ head_sampling_rate = 1 # 100% of requests are logged (1 = 100%)
 [version_metadata]
 binding = "CF_VERSION_METADATA"
 
-# KV binding for preferred backup server cache (15-minute TTL per target URL)
+# KV binding for preferred backup server cache (15-minute TTL per target domain)
 [[kv_namespaces]]
 binding = "BACKUP_SERVER_CACHE"
-

@@ -127,13 +127,93 @@ function parseBackupCorsServers(rawBackupServers) {
         .filter(Boolean);
 }
 
+function normalizeBackupCorsHeaders(rawHeaders, indexForError) {
+    if (rawHeaders === undefined || rawHeaders === null) {
+        return {};
+    }
+
+    if (typeof rawHeaders !== "object" || Array.isArray(rawHeaders)) {
+        throw new Error(
+            `BACKUP_CORS_SERVERS[${indexForError}].headers must be an object of string pairs`
+        );
+    }
+
+    const normalizedHeaders = {};
+    for (const [key, value] of Object.entries(rawHeaders)) {
+        const normalizedKey = String(key).trim();
+        if (!normalizedKey) {
+            continue;
+        }
+
+        if (value === undefined || value === null) {
+            continue;
+        }
+
+        normalizedHeaders[normalizedKey] = String(value);
+    }
+
+    return normalizedHeaders;
+}
+
+function normalizeBackupCorsServerEntries(parsedBackupServers) {
+    if (!Array.isArray(parsedBackupServers)) {
+        return [];
+    }
+
+    const normalizedServers = [];
+    const seenTemplates = new Set();
+
+    parsedBackupServers.forEach((serverEntry, index) => {
+        let rawTemplate = "";
+        let rawHeaders = null;
+
+        if (typeof serverEntry === "string") {
+            rawTemplate = serverEntry;
+        } else if (serverEntry && typeof serverEntry === "object" && !Array.isArray(serverEntry)) {
+            rawTemplate =
+                typeof serverEntry.url === "string"
+                    ? serverEntry.url
+                    : typeof serverEntry.server === "string"
+                    ? serverEntry.server
+                    : "";
+            rawHeaders = serverEntry.headers;
+        } else {
+            return;
+        }
+
+        const trimmedTemplate = rawTemplate.trim();
+        if (!trimmedTemplate) {
+            return;
+        }
+
+        const normalizedTemplate = trimmedTemplate.match(/^https?:\/\//i)
+            ? trimmedTemplate
+            : `https://${trimmedTemplate}`;
+        const validationUrl = normalizedTemplate.replaceAll("{url}", "https://example.com");
+        new URL(validationUrl);
+
+        const templateWithoutTrailingSlash = normalizedTemplate.replace(/\/+$/, "");
+        if (seenTemplates.has(templateWithoutTrailingSlash)) {
+            return;
+        }
+        seenTemplates.add(templateWithoutTrailingSlash);
+
+        normalizedServers.push({
+            template: templateWithoutTrailingSlash,
+            headers: normalizeBackupCorsHeaders(rawHeaders, index)
+        });
+    });
+
+    return normalizedServers;
+}
+
 /**
  * Get configuration from Cloudflare Secrets or environment variables, with fallback to defaults
  *
  * Configuration values should be JSON arrays:
  * - BLACKLIST_URLS: JSON array of regex patterns for blacklisted URLs
  * - WHITELIST_ORIGINS: JSON array of regex patterns for whitelisted origins
- * - BACKUP_CORS_SERVERS: JSON array of backup CORS proxy URLs
+ * - BACKUP_CORS_SERVERS: JSON array of backup CORS proxy templates or config objects
  * - MAX_RETRY_ATTEMPTS: non-negative integer retry count after first attempt
  *
  * Priority order (highest to lowest):
@@ -151,7 +231,7 @@ function parseBackupCorsServers(rawBackupServers) {
  *   [vars]
  *   BLACKLIST_URLS = '["^https?://malicious\\.com"]'
  *   WHITELIST_ORIGINS = '["^https://example\\.com$"]'
- *   BACKUP_CORS_SERVERS = '["https://backup-1.workers.dev", "https://backup-2.workers.dev"]'
+ *   BACKUP_CORS_SERVERS = '["https://backup-1.workers.dev/?url={url}", {"url":"https://backup-2.workers.dev/?url={url}","headers":{"x-cors-api-key":"token"}}]'
  *   MAX_RETRY_ATTEMPTS = '3'
  *
  * Secrets take precedence over vars if both are set.
@@ -159,7 +239,10 @@ function parseBackupCorsServers(rawBackupServers) {
 function getConfig(env) {
     let blacklistUrls = DEFAULT_BLACKLIST_URLS;
     let whitelistOrigins = DEFAULT_WHITELIST_ORIGINS;
-    let backupCorsServers = DEFAULT_BACKUP_CORS_SERVERS;
+    const defaultNormalizedBackupCorsServers = normalizeBackupCorsServerEntries(
+        DEFAULT_BACKUP_CORS_SERVERS
+    );
+    let backupCorsServers = defaultNormalizedBackupCorsServers;
     let maxRetryAttempts = DEFAULT_MAX_RETRY_ATTEMPTS;
 
     // Try to read from environment variables
@@ -207,7 +290,11 @@ function getConfig(env) {
         // Parse backup CORS servers from env var (JSON array)
         // Supports both BACKUP_CORS_SERVERS (preferred) and legacy DEFAULT_BACKUP_CORS_SERVERS.
         const rawBackupServers = env.BACKUP_CORS_SERVERS ?? env.DEFAULT_BACKUP_CORS_SERVERS;
-        if (rawBackupServers !== undefined && rawBackupServers !== null && rawBackupServers !== "") {
+        if (
+            rawBackupServers !== undefined &&
+            rawBackupServers !== null &&
+            rawBackupServers !== ""
+        ) {
             try {
                 if (!env.BACKUP_CORS_SERVERS && env.DEFAULT_BACKUP_CORS_SERVERS) {
                     console.warn(
@@ -221,39 +308,17 @@ function getConfig(env) {
                     console.warn(
                         `[${new Date().toISOString()}] ⚠️  BACKUP_CORS_SERVERS must be a JSON array, using default`
                     );
-                    backupCorsServers = DEFAULT_BACKUP_CORS_SERVERS;
+                    backupCorsServers = defaultNormalizedBackupCorsServers;
                 } else {
-                    backupCorsServers = Array.from(
-                        new Set(
-                            parsedBackupServers
-                                .filter(server => typeof server === "string" && server.trim() !== "")
-                                .map(server => {
-                                    const trimmedServer = server.trim();
-                                    const normalized = trimmedServer.match(/^https?:\/\//i)
-                                        ? trimmedServer
-                                        : `https://${trimmedServer}`;
-
-                                    // Keep template placeholders (e.g. {url}) as-is.
-                                    // Validate by substituting a sample URL only for parsing.
-                                    const validationUrl = normalized.replaceAll("{url}", "https://example.com");
-                                    new URL(validationUrl);
-
-                                    return normalized.replace(/\/+$/, "");
-                                })
-                        )
-                    );
-
-                    console.log(
-                        `[${new Date().toISOString()}] 📝  BACKUP_CORS_SERVERS: ${JSON.stringify(
-                            backupCorsServers
-                        )}`
-                    );
+                    backupCorsServers = normalizeBackupCorsServerEntries(parsedBackupServers);
                 }
             } catch (e) {
                 console.warn(
-                    `[${new Date().toISOString()}] ⚠️  Failed to parse BACKUP_CORS_SERVERS from env: ${e.message}. Supported formats: JSON array, quoted list, comma/newline separated URLs. Using default`
+                    `[${new Date().toISOString()}] ⚠️  Failed to parse BACKUP_CORS_SERVERS from env: ${
+                        e.message
+                    }. Supported formats: JSON array (string URLs or {url,headers} objects), quoted list, comma/newline separated URLs. Using default`
                 );
-                backupCorsServers = DEFAULT_BACKUP_CORS_SERVERS;
+                backupCorsServers = defaultNormalizedBackupCorsServers;
             }
         }
 
@@ -286,8 +351,22 @@ function buildBackupTargetUrl(backupCorsServer, destinationUrl) {
         .replace(/%7Burl%7D/gi, destinationUrl);
 }
 
+function getPreferredBackupScope(targetUrl) {
+    const normalizedTargetUrl = typeof targetUrl === "string" ? targetUrl.trim() : "";
+    if (!normalizedTargetUrl) {
+        return "";
+    }
+
+    try {
+        return new URL(normalizedTargetUrl).hostname.toLowerCase();
+    } catch (error) {
+        return normalizedTargetUrl.toLowerCase();
+    }
+}
+
 function buildPreferredBackupCacheKey(targetUrl) {
-    return `${PREFERRED_BACKUP_KV_KEY_PREFIX}${encodeURIComponent(targetUrl)}`;
+    const targetDomain = getPreferredBackupScope(targetUrl);
+    return `${PREFERRED_BACKUP_KV_KEY_PREFIX}${encodeURIComponent(targetDomain)}`;
 }
 
 function rotateArray(values, startIndex) {
@@ -348,10 +427,10 @@ async function getPreferredBackupServer(env, targetUrl) {
         const preferredBackupServer = typeof cachedValue === "string" ? cachedValue.trim() : "";
         return preferredBackupServer || null;
     } catch (error) {
+        const targetDomain = getPreferredBackupScope(targetUrl);
         console.warn(
-            `[${new Date().toISOString()}] ⚠️  Failed to read preferred backup cache for ${targetUrl}: ${
-                error.message
-            }`
+            `[${new Date().toISOString()}] ⚠️  Failed to read preferred backup cache for ${targetDomain ||
+                targetUrl}: ${error.message}`
         );
         return null;
     }
@@ -369,10 +448,10 @@ async function setPreferredBackupServer(env, targetUrl, backupCorsServer) {
             expirationTtl: PREFERRED_BACKUP_TTL_SECONDS
         });
     } catch (error) {
+        const targetDomain = getPreferredBackupScope(targetUrl);
         console.warn(
-            `[${new Date().toISOString()}] ⚠️  Failed to write preferred backup cache for ${targetUrl}: ${
-                error.message
-            }`
+            `[${new Date().toISOString()}] ⚠️  Failed to write preferred backup cache for ${targetDomain ||
+                targetUrl}: ${error.message}`
         );
     }
 }
@@ -384,19 +463,14 @@ async function clearPreferredBackupServer(env, targetUrl, reason = "") {
             return;
         }
 
+        const targetDomain = getPreferredBackupScope(targetUrl);
         const cacheKey = buildPreferredBackupCacheKey(targetUrl);
         await backupServerCache.delete(cacheKey);
-
-        console.log(
-            `[${new Date().toISOString()}] 🧹 Cleared preferred backup cache for ${targetUrl}${
-                reason ? ` | Reason: ${reason}` : ""
-            }`
-        );
     } catch (error) {
+        const targetDomain = getPreferredBackupScope(targetUrl);
         console.warn(
-            `[${new Date().toISOString()}] ⚠️  Failed to clear preferred backup cache for ${targetUrl}: ${
-                error.message
-            }`
+            `[${new Date().toISOString()}] ⚠️  Failed to clear preferred backup cache for ${targetDomain ||
+                targetUrl}: ${error.message}`
         );
     }
 }
@@ -509,21 +583,6 @@ export default {
         const connectingIp = request.headers.get("CF-Connecting-IP");
         const country = request.cf?.country;
         const colo = request.cf?.colo;
-
-        // Build version info string for logging
-        const versionInfo = versionId
-            ? `Version: ${version} (id: ${versionId}${versionTag ? `, tag: ${versionTag}` : ""}${
-                  versionTimestamp ? `, ts: ${versionTimestamp}` : ""
-              })`
-            : `Version: ${version}`;
-
-        console.log(
-            `[${new Date().toISOString()}] ${request.method} ${originUrl.pathname}${
-                originUrl.search
-            } | Origin: ${originHeader || "none"} | IP: ${connectingIp ||
-                "unknown"} | Country: ${country || "unknown"} | Colo: ${colo ||
-                "unknown"} | ${versionInfo}`
-        );
 
         // Function to modify headers to enable CORS
         const setupCORSHeaders = headers => {
@@ -678,11 +737,6 @@ export default {
                 // Add Access-Control-Max-Age for preflight caching (24 hours)
                 // This allows browsers to cache the preflight response and avoid repeated OPTIONS requests
                 preflightHeaders.set("Access-Control-Max-Age", "86400");
-
-                console.log(
-                    `[${new Date().toISOString()}] ✅ Preflight handled: ${targetUrl} | Origin: ${originHeader ||
-                        "none"}`
-                );
 
                 return new Response(null, {
                     status: 200,
@@ -841,7 +895,10 @@ export default {
             // Build attempt sequence: direct target first, then backup CORS servers
             const filteredBackupServers = config.backupCorsServers.filter(server => {
                 try {
-                    return new URL(server).origin !== originUrl.origin;
+                    return (
+                        new URL(buildBackupTargetUrl(server.template, "https://example.com"))
+                            .origin !== originUrl.origin
+                    );
                 } catch (e) {
                     return false;
                 }
@@ -852,15 +909,14 @@ export default {
             let preferredBackupServer = null;
             preferredBackupServer = await getPreferredBackupServer(env, targetUrl);
             if (preferredBackupServer) {
-                if (prioritizedBackupServers.includes(preferredBackupServer)) {
-                    const preferredIndex = prioritizedBackupServers.indexOf(preferredBackupServer);
+                const preferredIndex = prioritizedBackupServers.findIndex(
+                    server => server.template === preferredBackupServer
+                );
+                if (preferredIndex >= 0) {
+                    const preferredServerConfig = prioritizedBackupServers[preferredIndex];
                     prioritizedBackupServers.splice(preferredIndex, 1);
-                    prioritizedBackupServers.unshift(preferredBackupServer);
+                    prioritizedBackupServers.unshift(preferredServerConfig);
                     preferredBackupCacheHit = true;
-
-                    console.log(
-                        `[${new Date().toISOString()}] ⭐ Preferred backup server hit: ${preferredBackupServer} | TTL: ${PREFERRED_BACKUP_TTL_SECONDS}s`
-                    );
                 } else {
                     ctx.waitUntil(
                         clearPreferredBackupServer(
@@ -879,22 +935,21 @@ export default {
                     const nonPreferredServers = prioritizedBackupServers.slice(1);
 
                     if (nonPreferredServers.length > 1) {
-                        const rotationStartIndex = getNextBackupRotationStart(nonPreferredServers.length);
+                        const rotationStartIndex = getNextBackupRotationStart(
+                            nonPreferredServers.length
+                        );
                         prioritizedBackupServers = [
                             pinnedPreferredServer,
                             ...rotateArray(nonPreferredServers, rotationStartIndex)
                         ];
-
-                        console.log(
-                            `[${new Date().toISOString()}] 🔄 Rotating non-preferred backup servers (start index: ${rotationStartIndex}) for ${targetUrl} | Preferred pinned: ${pinnedPreferredServer}`
-                        );
                     }
                 } else {
-                    const rotationStartIndex = getNextBackupRotationStart(prioritizedBackupServers.length);
-                    prioritizedBackupServers = rotateArray(prioritizedBackupServers, rotationStartIndex);
-
-                    console.log(
-                        `[${new Date().toISOString()}] 🔄 Rotating backup servers (start index: ${rotationStartIndex}) for ${targetUrl}`
+                    const rotationStartIndex = getNextBackupRotationStart(
+                        prioritizedBackupServers.length
+                    );
+                    prioritizedBackupServers = rotateArray(
+                        prioritizedBackupServers,
+                        rotationStartIndex
                     );
                 }
             }
@@ -902,20 +957,16 @@ export default {
             const attemptTargets = [
                 { url: targetUrl, mode: "direct" },
                 ...prioritizedBackupServers.map(server => ({
-                    url: buildBackupTargetUrl(server, targetUrl),
+                    url: buildBackupTargetUrl(server.template, targetUrl),
                     mode: "backup",
-                    backupServer: server,
-                    preferred: preferredBackupCacheHit && Boolean(preferredBackupServer) && server === preferredBackupServer
+                    backupServer: server.template,
+                    backupHeaders: server.headers,
+                    preferred:
+                        preferredBackupCacheHit &&
+                        Boolean(preferredBackupServer) &&
+                        server.template === preferredBackupServer
                 }))
             ];
-
-            if (prioritizedBackupServers.length > 0) {
-                console.log(
-                    `[${new Date().toISOString()}] 🧭 Backup server order for ${targetUrl}: ${prioritizedBackupServers.join(
-                        " -> "
-                    )}`
-                );
-            }
 
             // MAX_RETRY_ATTEMPTS means retry count after initial attempt.
             // Ensure we still try every backup server at least once before giving up,
@@ -923,22 +974,28 @@ export default {
             const configuredMaxAttempts = Math.max(1, config.maxRetryAttempts + 1);
             const maxTotalAttempts = Math.max(configuredMaxAttempts, attemptTargets.length);
 
-            const createAttemptRequest = attemptUrl =>
-                new Request(attemptUrl, {
+            const createAttemptRequest = attemptTarget => {
+                const attemptHeaders = { ...filteredHeaders };
+                if (attemptTarget.mode === "backup" && attemptTarget.backupHeaders) {
+                    Object.assign(attemptHeaders, attemptTarget.backupHeaders);
+                }
+
+                return new Request(attemptTarget.url, {
                     method: requestMethod,
-                    headers: filteredHeaders,
+                    headers: attemptHeaders,
                     body: hasRequestBody ? requestBody : null,
                     redirect: "follow"
                 });
+            };
 
             try {
                 let lastNetworkError = null;
+                let loggedSensitiveBackupOverride = false;
 
                 for (let attemptIndex = 0; attemptIndex < maxTotalAttempts; attemptIndex++) {
                     const targetIndex = Math.min(attemptIndex, attemptTargets.length - 1);
                     const currentAttemptTarget = attemptTargets[targetIndex];
                     const isLastAttempt = attemptIndex === maxTotalAttempts - 1;
-                    const currentAttemptNumber = attemptIndex + 1;
 
                     if (
                         currentAttemptTarget.mode === "backup" &&
@@ -966,57 +1023,35 @@ export default {
                     if (
                         currentAttemptTarget.mode === "backup" &&
                         allowSensitiveBackup &&
-                        hasSensitiveHeadersForBackup(request, customHeaders)
+                        hasSensitiveHeadersForBackup(request, customHeaders) &&
+                        !loggedSensitiveBackupOverride
                     ) {
+                        loggedSensitiveBackupOverride = true;
                         console.warn(
                             `[${new Date().toISOString()}] ⚠️  Sensitive headers allowed for backup because allowSensitive=true | Target: ${targetUrl}`
                         );
                     }
 
-                    if (currentAttemptTarget.mode === "backup") {
-                        console.log(
-                            `[${new Date().toISOString()}] 🔁 Trying backup server (${currentAttemptNumber}/${maxTotalAttempts}): ${
-                                currentAttemptTarget.backupServer
-                            } | Target: ${targetUrl}`
-                        );
-                    }
-
-                    console.log(
-                        `[${new Date().toISOString()}] Fetching attempt ${currentAttemptNumber}/${maxTotalAttempts}: ${
-                            currentAttemptTarget.url
-                        } | Mode: ${currentAttemptTarget.mode} | Method: ${requestMethod}`
-                    );
-
                     let response;
                     try {
-                        response = await fetch(createAttemptRequest(currentAttemptTarget.url));
+                        response = await fetch(createAttemptRequest(currentAttemptTarget));
                     } catch (error) {
                         lastNetworkError = error;
 
-                        if (currentAttemptTarget.mode === "backup") {
-                            console.warn(
-                                `[${new Date().toISOString()}] ⚠️  Backup server network failure: ${
-                                    currentAttemptTarget.backupServer
-                                } | Error: ${error.message}`
+                        if (
+                            currentAttemptTarget.mode === "backup" &&
+                            currentAttemptTarget.preferred
+                        ) {
+                            ctx.waitUntil(
+                                clearPreferredBackupServer(
+                                    env,
+                                    targetUrl,
+                                    `preferred backup server network failure (${error.message})`
+                                )
                             );
-
-                            if (currentAttemptTarget.preferred) {
-                                ctx.waitUntil(
-                                    clearPreferredBackupServer(
-                                        env,
-                                        targetUrl,
-                                        `preferred backup server network failure (${error.message})`
-                                    )
-                                );
-                            }
                         }
 
                         if (!isLastAttempt) {
-                            console.warn(
-                                `[${new Date().toISOString()}] ⚠️  Network error on attempt ${currentAttemptNumber}/${maxTotalAttempts}: ${
-                                    error.message
-                                } | Retrying...`
-                            );
                             continue;
                         }
 
@@ -1025,27 +1060,18 @@ export default {
 
                     // Retry on selected upstream status codes
                     if (isRetryableStatusCode(response.status) && !isLastAttempt) {
-                        if (currentAttemptTarget.mode === "backup") {
-                            console.warn(
-                                `[${new Date().toISOString()}] ⚠️  Backup server retryable status: ${
-                                    currentAttemptTarget.backupServer
-                                } | Status: ${response.status} | Trying next server...`
+                        if (
+                            currentAttemptTarget.mode === "backup" &&
+                            currentAttemptTarget.preferred
+                        ) {
+                            ctx.waitUntil(
+                                clearPreferredBackupServer(
+                                    env,
+                                    targetUrl,
+                                    `preferred backup server returned retryable status ${response.status}`
+                                )
                             );
-
-                            if (currentAttemptTarget.preferred) {
-                                ctx.waitUntil(
-                                    clearPreferredBackupServer(
-                                        env,
-                                        targetUrl,
-                                        `preferred backup server returned retryable status ${response.status}`
-                                    )
-                                );
-                            }
                         }
-
-                        console.warn(
-                            `[${new Date().toISOString()}] ⚠️  Retryable status ${response.status} on attempt ${currentAttemptNumber}/${maxTotalAttempts} | Retrying...`
-                        );
 
                         // Ensure body stream is closed before retrying
                         if (response.body) {
@@ -1055,12 +1081,6 @@ export default {
                     }
 
                     if (currentAttemptTarget.mode === "backup") {
-                        console.log(
-                            `[${new Date().toISOString()}] 🔁 Using ${
-                                currentAttemptTarget.preferred ? "preferred " : ""
-                            }backup CORS server: ${currentAttemptTarget.backupServer} | Attempt: ${currentAttemptNumber}/${maxTotalAttempts}`
-                        );
-
                         if (!isRetryableStatusCode(response.status)) {
                             ctx.waitUntil(
                                 setPreferredBackupServer(
@@ -1072,86 +1092,54 @@ export default {
                         }
                     }
 
-                const responseHeaders = new Headers(response.headers);
-                const exposedHeaders = Array.from(response.headers.keys());
-                const allResponseHeaders = Object.fromEntries(response.headers.entries());
+                    const responseHeaders = new Headers(response.headers);
+                    const exposedHeaders = Array.from(response.headers.keys());
+                    const allResponseHeaders = Object.fromEntries(response.headers.entries());
 
-                exposedHeaders.push("cors-received-headers");
-                setupCORSHeaders(responseHeaders);
+                    exposedHeaders.push("cors-received-headers");
+                    setupCORSHeaders(responseHeaders);
 
-                responseHeaders.set("Access-Control-Expose-Headers", exposedHeaders.join(","));
-                responseHeaders.set("cors-received-headers", JSON.stringify(allResponseHeaders));
-
-                // Check if this is a streaming response (for AI model streaming, SSE, etc.)
-                const isStreaming = shouldStreamResponse(response, request, targetUrl);
-
-                // For streaming responses, pass through the stream directly
-                // For non-streaming, buffer the response as before for backward compatibility
-                let responseBody;
-                if (isPreflightRequest) {
-                    responseBody = null;
-                } else if (isStreaming) {
-                    // Pass through the stream directly - don't buffer
-                    // This allows Server-Sent Events and chunked streaming to work properly
-                    responseBody = response.body;
-                    console.log(
-                        `[${new Date().toISOString()}] 📡 Streaming response detected: ${targetUrl} | Content-Type: ${responseHeaders.get(
-                            "content-type"
-                        ) || "unknown"}`
+                    responseHeaders.set("Access-Control-Expose-Headers", exposedHeaders.join(","));
+                    responseHeaders.set(
+                        "cors-received-headers",
+                        JSON.stringify(allResponseHeaders)
                     );
-                } else {
-                    // Buffer the response for non-streaming responses
-                    responseBody = await response.arrayBuffer();
-                }
 
-                const duration = Date.now() - startTime;
+                    // Check if this is a streaming response (for AI model streaming, SSE, etc.)
+                    const isStreaming = shouldStreamResponse(response, request, targetUrl);
 
-                // Log success or error based on status code
-                // For streaming responses, log immediately (can't wait for completion)
-                if (isStreaming) {
-                    if (response.status >= 200 && response.status < 300) {
-                        console.log(
-                            `[${new Date().toISOString()}] ✅ Streaming started: ${targetUrl} | Status: ${
-                                response.status
-                            } | Method: ${request.method}`
-                        );
-                    } else if (response.status >= 400) {
-                        console.warn(
-                            `[${new Date().toISOString()}] ⚠️  Streaming error: ${targetUrl} | Status: ${
-                                response.status
-                            } ${response.statusText} | Method: ${request.method}`
-                        );
+                    // For streaming responses, pass through the stream directly
+                    // For non-streaming, buffer the response as before for backward compatibility
+                    let responseBody;
+                    if (isPreflightRequest) {
+                        responseBody = null;
+                    } else if (isStreaming) {
+                        // Pass through the stream directly - don't buffer
+                        // This allows Server-Sent Events and chunked streaming to work properly
+                        responseBody = response.body;
+                    } else {
+                        // Buffer the response for non-streaming responses
+                        responseBody = await response.arrayBuffer();
                     }
-                } else {
-                    // Non-streaming: log after buffering is complete
-                    if (response.status >= 200 && response.status < 300) {
-                        console.log(
-                            `[${new Date().toISOString()}] ✅ Success: ${targetUrl} | Status: ${
-                                response.status
-                            } | Duration: ${duration}ms | Method: ${request.method}`
-                        );
-                    } else if (response.status >= 400) {
+
+                    const duration = Date.now() - startTime;
+
+                    // Keep only essential upstream failure logs.
+                    if (response.status >= 500) {
                         console.warn(
-                            `[${new Date().toISOString()}] ⚠️  HTTP Error: ${targetUrl} | Status: ${
+                            `[${new Date().toISOString()}] ⚠️  Upstream server error: ${targetUrl} | Status: ${
                                 response.status
                             } ${response.statusText} | Duration: ${duration}ms | Method: ${
                                 request.method
                             }`
                         );
-                    } else {
-                        console.log(
-                            `[${new Date().toISOString()}] ℹ️  Response: ${targetUrl} | Status: ${
-                                response.status
-                            } | Duration: ${duration}ms | Method: ${request.method}`
-                        );
                     }
-                }
 
-                return new Response(responseBody, {
-                    headers: responseHeaders,
-                    status: isPreflightRequest ? 200 : response.status,
-                    statusText: isPreflightRequest ? "OK" : response.statusText
-                });
+                    return new Response(responseBody, {
+                        headers: responseHeaders,
+                        status: isPreflightRequest ? 200 : response.status,
+                        statusText: isPreflightRequest ? "OK" : response.statusText
+                    });
                 }
 
                 // Should never happen, but keep a deterministic fallback
@@ -1221,9 +1209,10 @@ export default {
                 "",
                 "Backup:",
                 "BACKUP_CORS_SERVERS must contain {url} placeholder",
+                'Supports per-backup headers: {"url":"...","headers":{"x-cors-api-key":"..."}}',
                 "Retryable statuses: all 4xx + 502 + 503",
                 "Backup servers rotate each request (preferred stays first, others rotate)",
-                "Successful backup is cached as preferred for 15 minutes (KV)",
+                "Successful backup is cached as preferred for 15 minutes per domain (KV)",
                 "Sensitive headers block backup by default (override with allowSensitive=true)",
                 "",
                 "Limits: 100,000 requests/day",
