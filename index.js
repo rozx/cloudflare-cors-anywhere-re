@@ -28,6 +28,7 @@ const DEFAULT_VERSION = PACKAGE_VERSION; // Version from package.json (auto-gene
 const RETRYABLE_5XX_STATUS_CODES = new Set([502, 503]);
 const PREFERRED_BACKUP_TTL_SECONDS = 15 * 60; // 15 minutes
 const PREFERRED_BACKUP_KV_KEY_PREFIX = "backup-preference:";
+let backupServerRotationCursor = 0;
 
 /**
  * Get version metadata from Cloudflare Version Metadata binding or environment variable or default
@@ -287,6 +288,25 @@ function buildBackupTargetUrl(backupCorsServer, destinationUrl) {
 
 function buildPreferredBackupCacheKey(targetUrl) {
     return `${PREFERRED_BACKUP_KV_KEY_PREFIX}${encodeURIComponent(targetUrl)}`;
+}
+
+function rotateArray(values, startIndex) {
+    if (!Array.isArray(values) || values.length === 0) {
+        return [];
+    }
+
+    const normalizedStartIndex = ((startIndex % values.length) + values.length) % values.length;
+    return [...values.slice(normalizedStartIndex), ...values.slice(0, normalizedStartIndex)];
+}
+
+function getNextBackupRotationStart(totalServers) {
+    if (!Number.isInteger(totalServers) || totalServers <= 0) {
+        return 0;
+    }
+
+    const startIndex = backupServerRotationCursor % totalServers;
+    backupServerRotationCursor = (backupServerRotationCursor + 1) % Number.MAX_SAFE_INTEGER;
+    return startIndex;
 }
 
 function hasSensitiveHeadersForBackup(request, customHeaders) {
@@ -803,10 +823,11 @@ export default {
                 }
             });
 
-            const prioritizedBackupServers = [...filteredBackupServers];
+            let prioritizedBackupServers = [...filteredBackupServers];
             let preferredBackupCacheHit = false;
+            let preferredBackupServer = null;
             if (prioritizedBackupServers.length > 0) {
-                const preferredBackupServer = await getPreferredBackupServer(env, targetUrl);
+                preferredBackupServer = await getPreferredBackupServer(env, targetUrl);
                 if (preferredBackupServer && prioritizedBackupServers.includes(preferredBackupServer)) {
                     const preferredIndex = prioritizedBackupServers.indexOf(preferredBackupServer);
                     prioritizedBackupServers.splice(preferredIndex, 1);
@@ -819,29 +840,23 @@ export default {
                 }
             }
 
-            const preferredBackupServer = prioritizedBackupServers[0] || null;
-            const hasPreferredBackup = preferredBackupCacheHit && Boolean(preferredBackupServer);
+            if (prioritizedBackupServers.length > 1) {
+                const rotationStartIndex = getNextBackupRotationStart(prioritizedBackupServers.length);
+                prioritizedBackupServers = rotateArray(prioritizedBackupServers, rotationStartIndex);
+
+                console.log(
+                    `[${new Date().toISOString()}] 🔄 Rotating backup servers (start index: ${rotationStartIndex}) for ${targetUrl}`
+                );
+            }
 
             const attemptTargets = [
-                ...(hasPreferredBackup
-                    ? [
-                          {
-                              url: buildBackupTargetUrl(preferredBackupServer, targetUrl),
-                              mode: "backup",
-                              backupServer: preferredBackupServer,
-                              preferred: true
-                          }
-                      ]
-                    : []),
                 { url: targetUrl, mode: "direct" },
-                ...prioritizedBackupServers
-                    .slice(hasPreferredBackup ? 1 : 0)
-                    .map(server => ({
-                        url: buildBackupTargetUrl(server, targetUrl),
-                        mode: "backup",
-                        backupServer: server,
-                        preferred: false
-                    }))
+                ...prioritizedBackupServers.map(server => ({
+                    url: buildBackupTargetUrl(server, targetUrl),
+                    mode: "backup",
+                    backupServer: server,
+                    preferred: preferredBackupCacheHit && Boolean(preferredBackupServer) && server === preferredBackupServer
+                }))
             ];
 
             if (prioritizedBackupServers.length > 0) {
@@ -1134,7 +1149,8 @@ export default {
                 "Backup:",
                 "BACKUP_CORS_SERVERS must contain {url} placeholder",
                 "Retryable statuses: all 4xx + 502 + 503",
-                "Preferred backup server is cached for 15 minutes (KV)",
+                "Backup servers rotate each request to spread load",
+                "Successful backup is cached as preferred for 15 minutes (KV)",
                 "Sensitive headers block backup by default (override with allowSensitive=true)",
                 "",
                 "Limits: 100,000 requests/day",
