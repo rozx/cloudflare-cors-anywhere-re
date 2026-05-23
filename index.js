@@ -29,6 +29,29 @@ const RETRYABLE_STATUS_CODES = new Set([403, 429, 502, 503]);
 const PREFERRED_BACKUP_TTL_SECONDS = 15 * 60; // 15 minutes
 const PREFERRED_BACKUP_KV_KEY_PREFIX = "backup-preference:";
 let backupServerRotationCursor = 0;
+const LOG_REDACTED_VALUE = "[REDACTED]";
+const SENSITIVE_LOG_QUERY_PARAM_EXACT_NAMES = new Set([
+    "key",
+    "token",
+    "auth",
+    "password",
+    "passwd",
+    "secret",
+    "signature",
+    "sig",
+    "jwt"
+]);
+const SENSITIVE_LOG_QUERY_PARAM_SUFFIXES = [
+    "apikey",
+    "accesstoken",
+    "refreshtoken",
+    "authtoken",
+    "clientsecret",
+    "clienttoken",
+    "bearertoken",
+    "sessiontoken",
+    "privatekey"
+];
 
 /**
  * Get version metadata from Cloudflare Version Metadata binding or environment variable or default
@@ -155,6 +178,99 @@ function normalizeBackupCorsHeaders(rawHeaders, indexForError) {
     return normalizedHeaders;
 }
 
+function isSensitiveLogQueryParamName(paramName) {
+    const normalizedName = String(paramName)
+        .toLowerCase()
+        .replace(/[^a-z0-9]/g, "");
+
+    return (
+        SENSITIVE_LOG_QUERY_PARAM_EXACT_NAMES.has(normalizedName) ||
+        SENSITIVE_LOG_QUERY_PARAM_SUFFIXES.some(suffix => normalizedName.endsWith(suffix))
+    );
+}
+
+function replaceEncodedRedactionPlaceholder(value) {
+    return value.replace(/%5BREDACTED%5D/gi, LOG_REDACTED_VALUE);
+}
+
+function redactQueryStringForLog(value) {
+    return String(value).replace(/([?&])([^=&#\s]+)=([^&#\s]*)/g, (match, prefix, name) => {
+        if (!isSensitiveLogQueryParamName(name)) {
+            return match;
+        }
+
+        return `${prefix}${name}=${LOG_REDACTED_VALUE}`;
+    });
+}
+
+function sanitizeUrlForLog(value, depth = 0) {
+    const rawValue = typeof value === "string" ? value : String(value ?? "");
+
+    if (!rawValue) {
+        return rawValue;
+    }
+
+    try {
+        const url = new URL(rawValue);
+        let changed = false;
+
+        if (url.username) {
+            url.username = LOG_REDACTED_VALUE;
+            changed = true;
+        }
+
+        if (url.password) {
+            url.password = LOG_REDACTED_VALUE;
+            changed = true;
+        }
+
+        const paramNames = Array.from(new Set(url.searchParams.keys()));
+
+        for (const paramName of paramNames) {
+            const values = url.searchParams.getAll(paramName);
+
+            if (isSensitiveLogQueryParamName(paramName)) {
+                url.searchParams.delete(paramName);
+                values.forEach(() => url.searchParams.append(paramName, LOG_REDACTED_VALUE));
+                changed = true;
+                continue;
+            }
+
+            if (depth >= 2) {
+                continue;
+            }
+
+            const sanitizedValues = values.map(paramValue =>
+                /^https?:\/\//i.test(paramValue)
+                    ? sanitizeUrlForLog(paramValue, depth + 1)
+                    : paramValue
+            );
+
+            if (sanitizedValues.some((paramValue, index) => paramValue !== values[index])) {
+                url.searchParams.delete(paramName);
+                sanitizedValues.forEach(paramValue =>
+                    url.searchParams.append(paramName, paramValue)
+                );
+                changed = true;
+            }
+        }
+
+        if (!changed) {
+            return rawValue;
+        }
+
+        return replaceEncodedRedactionPlaceholder(url.toString());
+    } catch (error) {
+        return redactQueryStringForLog(rawValue);
+    }
+}
+
+function sanitizeLogValue(value) {
+    return String(value ?? "").replace(/https?:\/\/[^\s"'<>]+/gi, matchedUrl =>
+        sanitizeUrlForLog(matchedUrl)
+    );
+}
+
 function normalizeBackupCorsServerEntries(parsedBackupServers) {
     if (!Array.isArray(parsedBackupServers)) {
         return [];
@@ -194,9 +310,9 @@ function normalizeBackupCorsServerEntries(parsedBackupServers) {
             new URL(validationUrl);
         } catch (e) {
             console.warn(
-                `[${new Date().toISOString()}] ⚠️  Skipping invalid backup server URL at index ${index}: ${trimmedTemplate} (${
-                    e.message
-                })`
+                `[${new Date().toISOString()}] ⚠️  Skipping invalid backup server URL at index ${index}: ${sanitizeUrlForLog(
+                    trimmedTemplate
+                )} (${sanitizeLogValue(e.message)})`
             );
             return;
         }
@@ -569,7 +685,7 @@ async function getPreferredBackupServer(env, targetUrl, ctx) {
         const targetDomain = getPreferredBackupScope(targetUrl);
         console.warn(
             `[${new Date().toISOString()}] ⚠️  Failed to read preferred backup cache for ${targetDomain ||
-                targetUrl}: ${error.message}`
+                sanitizeUrlForLog(targetUrl)}: ${sanitizeLogValue(error.message)}`
         );
         return null;
     }
@@ -634,7 +750,7 @@ async function setPreferredBackupServer(env, targetUrl, backupCorsServer) {
         const targetDomain = getPreferredBackupScope(targetUrl);
         console.warn(
             `[${new Date().toISOString()}] ⚠️  Failed to write preferred backup cache for ${targetDomain ||
-                targetUrl}: ${error.message}`
+                sanitizeUrlForLog(targetUrl)}: ${sanitizeLogValue(error.message)}`
         );
     }
 }
@@ -684,14 +800,14 @@ async function clearPreferredBackupServer(env, targetUrl, reason = "") {
         if (reason) {
             console.log(
                 `[${new Date().toISOString()}] ℹ️  Cleared preferred backup cache for ${targetDomain ||
-                    targetUrl}: ${reason}`
+                    sanitizeUrlForLog(targetUrl)}: ${sanitizeLogValue(reason)}`
             );
         }
     } catch (error) {
         const targetDomain = getPreferredBackupScope(targetUrl);
         console.warn(
             `[${new Date().toISOString()}] ⚠️  Failed to clear preferred backup cache for ${targetDomain ||
-                targetUrl}: ${error.message}`
+                sanitizeUrlForLog(targetUrl)}: ${sanitizeLogValue(error.message)}`
         );
     }
 }
@@ -934,9 +1050,9 @@ export default {
                 targetUrl = testUrl.href; // Normalize the URL to ensure it's properly formatted
             } catch (e) {
                 console.warn(
-                    `[${new Date().toISOString()}] ⚠️  Invalid target URL format: ${targetUrl}, error: ${
-                        e.message
-                    }`
+                    `[${new Date().toISOString()}] ⚠️  Invalid target URL format: ${sanitizeUrlForLog(
+                        targetUrl
+                    )}, error: ${sanitizeLogValue(e.message)}`
                 );
                 targetUrl = null; // Mark as invalid
             }
@@ -980,8 +1096,9 @@ export default {
                 setupCORSHeaders(errorHeaders);
 
                 console.warn(
-                    `[${new Date().toISOString()}] ⚠️  Preflight blocked: URL not whitelisted or origin not allowed | Target: ${targetUrl ||
-                        "none"} | Origin: ${originHeader || "none"}`
+                    `[${new Date().toISOString()}] ⚠️  Preflight blocked: URL not whitelisted or origin not allowed | Target: ${
+                        targetUrl ? sanitizeUrlForLog(targetUrl) : "none"
+                    } | Origin: ${originHeader || "none"}`
                 );
 
                 return new Response(null, {
@@ -1234,13 +1351,13 @@ export default {
                     console.warn(
                         `[${new Date().toISOString()}] 🚫 Backup servers removed from attempt list due to sensitive request headers: ${sensitiveHeaders.join(
                             ", "
-                        )} | Target: ${targetUrl}`
+                        )} | Target: ${sanitizeUrlForLog(targetUrl)}`
                     );
                 } else if (hasBackupTargets && hasSensitiveHeaders && allowSensitiveBackup) {
                     console.warn(
                         `[${new Date().toISOString()}] ⚠️  Sensitive headers allowed for backup because allowSensitive=true. Headers: ${sensitiveHeaders.join(
                             ", "
-                        )} | Target: ${targetUrl}`
+                        )} | Target: ${sanitizeUrlForLog(targetUrl)}`
                     );
                 }
 
@@ -1258,8 +1375,8 @@ export default {
                     if (currentAttemptTarget.mode === "backup") {
                         console.log(
                             `[${new Date().toISOString()}] ℹ️  Using backup server: ${
-                                currentAttemptTarget.backupServer
-                            } | Target: ${targetUrl}`
+                                sanitizeUrlForLog(currentAttemptTarget.backupServer)
+                            } | Target: ${sanitizeUrlForLog(targetUrl)}`
                         );
                     }
 
@@ -1281,8 +1398,8 @@ export default {
                         console.warn(
                             `[${new Date().toISOString()}] ⚠️  Failed to reach ${
                                 currentAttemptTarget.mode === "direct" ? "target" : "backup"
-                            } URL: ${currentAttemptTarget.url} | Error: ${
-                                error.message
+                            } URL: ${sanitizeUrlForLog(currentAttemptTarget.url)} | Error: ${
+                                sanitizeLogValue(error.message)
                             } | Attempt: ${attemptIndex + 1}/${effectiveMaxAttempts}`
                         );
 
@@ -1294,7 +1411,9 @@ export default {
                                 clearPreferredBackupServer(
                                     env,
                                     targetUrl,
-                                    `preferred backup server network failure (${error.message})`
+                                    `preferred backup server network failure (${sanitizeLogValue(
+                                        error.message
+                                    )})`
                                 )
                             );
                         }
@@ -1373,11 +1492,11 @@ export default {
                     // Keep only essential upstream failure logs.
                     if (response.status >= 500) {
                         console.warn(
-                            `[${new Date().toISOString()}] ⚠️  Upstream server error: ${targetUrl} | Status: ${
-                                response.status
-                            } ${response.statusText} | Duration: ${duration}ms | Method: ${
-                                request.method
-                            }`
+                            `[${new Date().toISOString()}] ⚠️  Upstream server error: ${sanitizeUrlForLog(
+                                targetUrl
+                            )} | Status: ${response.status} ${
+                                response.statusText
+                            } | Duration: ${duration}ms | Method: ${request.method}`
                         );
                     }
 
@@ -1393,18 +1512,23 @@ export default {
             } catch (error) {
                 const duration = Date.now() - startTime;
                 console.error(
-                    `[${new Date().toISOString()}] ❌ Error fetching ${targetUrl}: ${
-                        error.message
-                    } | Duration: ${duration}ms | Stack: ${error.stack}`
+                    `[${new Date().toISOString()}] ❌ Error fetching ${sanitizeUrlForLog(
+                        targetUrl
+                    )}: ${sanitizeLogValue(error.message)} | Duration: ${duration}ms | Stack: ${sanitizeLogValue(
+                        error.stack
+                    )}`
                 );
 
                 const errorHeaders = new Headers();
                 setupCORSHeaders(errorHeaders);
-                return new Response(`Error fetching target URL: ${error.message}`, {
-                    status: 502,
-                    statusText: "Bad Gateway",
-                    headers: errorHeaders
-                });
+                return new Response(
+                    `Error fetching target URL: ${sanitizeLogValue(error.message)}`,
+                    {
+                        status: 502,
+                        statusText: "Bad Gateway",
+                        headers: errorHeaders
+                    }
+                );
             }
         } else if (!targetUrl) {
             // No target URL provided, show info page
@@ -1480,8 +1604,9 @@ export default {
             });
         } else {
             console.warn(
-                `[${new Date().toISOString()}] ⚠️  Request blocked: URL not whitelisted or origin not allowed | Target: ${targetUrl} | Origin: ${originHeader ||
-                    "none"}`
+                `[${new Date().toISOString()}] ⚠️  Request blocked: URL not whitelisted or origin not allowed | Target: ${sanitizeUrlForLog(
+                    targetUrl
+                )} | Origin: ${originHeader || "none"}`
             );
 
             const errorHeaders = new Headers();
