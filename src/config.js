@@ -1,0 +1,318 @@
+import { sanitizeLogValue, sanitizeUrlForLog } from "./log-redaction.js";
+
+// Configuration: Default values (used as fallback if env vars are unavailable)
+const DEFAULT_BLACKLIST_URLS = []; // regexp for blacklisted urls
+const DEFAULT_WHITELIST_ORIGINS = [".*"]; // regexp for whitelisted origins
+const DEFAULT_BACKUP_CORS_SERVERS = []; // backup CORS proxy servers
+const DEFAULT_MAX_RETRY_ATTEMPTS = 3; // number of retries after the initial direct attempt
+
+const CONFIG_ENV_KEYS = [
+    "BLACKLIST_URLS",
+    "WHITELIST_ORIGINS",
+    "BACKUP_CORS_SERVERS",
+    "DEFAULT_BACKUP_CORS_SERVERS",
+    "MAX_RETRY_ATTEMPTS"
+];
+let cachedConfig = null;
+let cachedConfigSource = null;
+
+function parseBackupCorsServers(rawBackupServers) {
+    if (Array.isArray(rawBackupServers)) {
+        return rawBackupServers;
+    }
+
+    if (typeof rawBackupServers !== "string") {
+        return [];
+    }
+
+    const trimmed = rawBackupServers.trim();
+    if (!trimmed) {
+        return [];
+    }
+
+    // Preferred format: JSON array
+    if (trimmed.startsWith("[")) {
+        const parsed = JSON.parse(trimmed);
+        if (!Array.isArray(parsed)) {
+            throw new Error("BACKUP_CORS_SERVERS JSON must be an array");
+        }
+        return parsed;
+    }
+
+    // Compatibility: quoted list without []
+    // Example: "https://a?url={url}","https://b?url={url}"
+    if (trimmed.startsWith('"') && trimmed.endsWith('"') && trimmed.includes('","')) {
+        const parsed = JSON.parse(`[${trimmed}]`);
+        if (!Array.isArray(parsed)) {
+            throw new Error("BACKUP_CORS_SERVERS quoted list must be an array");
+        }
+        return parsed;
+    }
+
+    // Compatibility: comma/newline separated plain URLs
+    return trimmed
+        .split(/\r?\n|,/)
+        .map(entry => entry.trim().replace(/^['"]|['"]$/g, ""))
+        .filter(Boolean);
+}
+
+function normalizeBackupCorsHeaders(rawHeaders, indexForError) {
+    if (rawHeaders === undefined || rawHeaders === null) {
+        return {};
+    }
+
+    if (typeof rawHeaders !== "object" || Array.isArray(rawHeaders)) {
+        throw new Error(
+            `BACKUP_CORS_SERVERS[${indexForError}].headers must be an object of string pairs`
+        );
+    }
+
+    const normalizedHeaders = {};
+    for (const [key, value] of Object.entries(rawHeaders)) {
+        const normalizedKey = String(key).trim();
+        if (!normalizedKey) {
+            continue;
+        }
+
+        if (value === undefined || value === null) {
+            continue;
+        }
+
+        normalizedHeaders[normalizedKey] = String(value);
+    }
+
+    return normalizedHeaders;
+}
+
+function normalizeBackupCorsServerEntries(parsedBackupServers) {
+    if (!Array.isArray(parsedBackupServers)) {
+        return [];
+    }
+
+    const normalizedServers = [];
+    const seenTemplates = new Set();
+
+    parsedBackupServers.forEach((serverEntry, index) => {
+        let rawTemplate = "";
+        let rawHeaders = null;
+
+        if (typeof serverEntry === "string") {
+            rawTemplate = serverEntry;
+        } else if (serverEntry && typeof serverEntry === "object" && !Array.isArray(serverEntry)) {
+            rawTemplate =
+                typeof serverEntry.url === "string"
+                    ? serverEntry.url
+                    : typeof serverEntry.server === "string"
+                    ? serverEntry.server
+                    : "";
+            rawHeaders = serverEntry.headers;
+        } else {
+            return;
+        }
+
+        const trimmedTemplate = rawTemplate.trim();
+        if (!trimmedTemplate) {
+            return;
+        }
+
+        const normalizedTemplate = trimmedTemplate.match(/^https?:\/\//i)
+            ? trimmedTemplate
+            : `https://${trimmedTemplate}`;
+        const validationUrl = normalizedTemplate.replaceAll("{url}", "https://example.com");
+        let origin;
+        try {
+            origin = new URL(validationUrl).origin;
+        } catch (e) {
+            console.warn(
+                `[${new Date().toISOString()}] ⚠️  Skipping invalid backup server URL at index ${index}: ${sanitizeUrlForLog(
+                    trimmedTemplate
+                )} (${sanitizeLogValue(e.message)})`
+            );
+            return;
+        }
+
+        const templateWithoutTrailingSlash = normalizedTemplate.replace(/\/+$/, "");
+        if (seenTemplates.has(templateWithoutTrailingSlash)) {
+            return;
+        }
+        seenTemplates.add(templateWithoutTrailingSlash);
+
+        normalizedServers.push({
+            template: templateWithoutTrailingSlash,
+            origin,
+            headers: normalizeBackupCorsHeaders(rawHeaders, index)
+        });
+    });
+
+    return normalizedServers;
+}
+
+/**
+ * Get configuration from Cloudflare Secrets or environment variables, with fallback to defaults
+ *
+ * Configuration values should be JSON arrays:
+ * - BLACKLIST_URLS: JSON array of regex patterns for blacklisted URLs
+ * - WHITELIST_ORIGINS: JSON array of regex patterns for whitelisted origins
+ * - BACKUP_CORS_SERVERS: JSON array of backup CORS proxy templates or config objects
+ * - MAX_RETRY_ATTEMPTS: non-negative integer retry count after first attempt
+ *
+ * Priority order (highest to lowest):
+ * 1. Direct secrets (env.BLACKLIST_URLS) - set via wrangler secret put
+ * 2. Environment variables (env.BLACKLIST_URLS) - from wrangler.toml [vars]
+ * 3. Default values
+ *
+ * Setup using Cloudflare Secrets (recommended for security):
+ *   wrangler secret put BLACKLIST_URLS
+ *   wrangler secret put WHITELIST_ORIGINS
+ *   wrangler secret put BACKUP_CORS_SERVERS
+ *   wrangler secret put MAX_RETRY_ATTEMPTS
+ *
+ * Or using wrangler.toml [vars] section (for non-sensitive config):
+ *   [vars]
+ *   BLACKLIST_URLS = '["^https?://malicious\\.com"]'
+ *   WHITELIST_ORIGINS = '["^https://example\\.com$"]'
+ *   BACKUP_CORS_SERVERS = '["https://backup-1.workers.dev/?url={url}", {"url":"https://backup-2.workers.dev/?url={url}","headers":{"x-cors-api-key":"token"}}]'
+ *   MAX_RETRY_ATTEMPTS = '3'
+ *
+ * Secrets take precedence over vars if both are set.
+ *
+ * The parsed config is cached per isolate and reused until one of the raw env values changes,
+ * so JSON parsing, regex compilation and backup normalization happen once instead of per request.
+ */
+export function getConfig(env) {
+    const source = CONFIG_ENV_KEYS.map(key => env?.[key]);
+    if (
+        cachedConfig &&
+        cachedConfigSource.every((rawValue, index) => rawValue === source[index])
+    ) {
+        return cachedConfig;
+    }
+
+    cachedConfig = parseConfig(env);
+    cachedConfigSource = source;
+    return cachedConfig;
+}
+
+function compilePatternList(patterns, listName) {
+    const compiledPatterns = [];
+    for (const pattern of patterns) {
+        try {
+            compiledPatterns.push(pattern instanceof RegExp ? pattern : new RegExp(pattern));
+        } catch (e) {
+            console.warn(
+                `[${new Date().toISOString()}] ⚠️  Skipping invalid ${listName} pattern ${JSON.stringify(
+                    String(pattern)
+                )}: ${e.message}`
+            );
+        }
+    }
+    return compiledPatterns;
+}
+
+function parseConfig(env) {
+    let blacklistUrls = DEFAULT_BLACKLIST_URLS;
+    let whitelistOrigins = DEFAULT_WHITELIST_ORIGINS;
+    const defaultNormalizedBackupCorsServers = normalizeBackupCorsServerEntries(
+        DEFAULT_BACKUP_CORS_SERVERS
+    );
+    let backupCorsServers = defaultNormalizedBackupCorsServers;
+    let maxRetryAttempts = DEFAULT_MAX_RETRY_ATTEMPTS;
+
+    // Try to read from environment variables
+    if (env) {
+        // Parse blacklistUrls from env var (JSON array)
+        if (env.BLACKLIST_URLS) {
+            try {
+                blacklistUrls = JSON.parse(env.BLACKLIST_URLS);
+                if (!Array.isArray(blacklistUrls)) {
+                    console.warn(
+                        `[${new Date().toISOString()}] ⚠️  BLACKLIST_URLS must be a JSON array, using default`
+                    );
+                    blacklistUrls = DEFAULT_BLACKLIST_URLS;
+                }
+            } catch (e) {
+                console.warn(
+                    `[${new Date().toISOString()}] ⚠️  Failed to parse BLACKLIST_URLS from env: ${
+                        e.message
+                    }, using default`
+                );
+                blacklistUrls = DEFAULT_BLACKLIST_URLS;
+            }
+        }
+
+        // Parse whitelistOrigins from env var (JSON array)
+        if (env.WHITELIST_ORIGINS) {
+            try {
+                whitelistOrigins = JSON.parse(env.WHITELIST_ORIGINS);
+                if (!Array.isArray(whitelistOrigins)) {
+                    console.warn(
+                        `[${new Date().toISOString()}] ⚠️  WHITELIST_ORIGINS must be a JSON array, using default`
+                    );
+                    whitelistOrigins = DEFAULT_WHITELIST_ORIGINS;
+                }
+            } catch (e) {
+                console.warn(
+                    `[${new Date().toISOString()}] ⚠️  Failed to parse WHITELIST_ORIGINS from env: ${
+                        e.message
+                    }, using default`
+                );
+                whitelistOrigins = DEFAULT_WHITELIST_ORIGINS;
+            }
+        }
+
+        // Parse backup CORS servers from env var (JSON array)
+        // Supports both BACKUP_CORS_SERVERS (preferred) and legacy DEFAULT_BACKUP_CORS_SERVERS.
+        const rawBackupServers = env.BACKUP_CORS_SERVERS ?? env.DEFAULT_BACKUP_CORS_SERVERS;
+        if (
+            rawBackupServers !== undefined &&
+            rawBackupServers !== null &&
+            rawBackupServers !== ""
+        ) {
+            try {
+                if (!env.BACKUP_CORS_SERVERS && env.DEFAULT_BACKUP_CORS_SERVERS) {
+                    console.warn(
+                        `[${new Date().toISOString()}] ⚠️  Using legacy env key DEFAULT_BACKUP_CORS_SERVERS; prefer BACKUP_CORS_SERVERS`
+                    );
+                }
+
+                const parsedBackupServers = parseBackupCorsServers(rawBackupServers);
+
+                if (!Array.isArray(parsedBackupServers)) {
+                    console.warn(
+                        `[${new Date().toISOString()}] ⚠️  BACKUP_CORS_SERVERS must be a JSON array, using default`
+                    );
+                    backupCorsServers = defaultNormalizedBackupCorsServers;
+                } else {
+                    backupCorsServers = normalizeBackupCorsServerEntries(parsedBackupServers);
+                }
+            } catch (e) {
+                console.warn(
+                    `[${new Date().toISOString()}] ⚠️  Failed to parse BACKUP_CORS_SERVERS from env: ${
+                        e.message
+                    }. Supported formats: JSON array (string URLs or {url,headers} objects), quoted list, comma/newline separated URLs. Using default`
+                );
+                backupCorsServers = defaultNormalizedBackupCorsServers;
+            }
+        }
+
+        // Parse max retry attempts from env var (non-negative integer)
+        if (env.MAX_RETRY_ATTEMPTS !== undefined) {
+            const parsedMaxRetryAttempts = Number.parseInt(env.MAX_RETRY_ATTEMPTS, 10);
+            if (Number.isInteger(parsedMaxRetryAttempts) && parsedMaxRetryAttempts >= 0) {
+                maxRetryAttempts = parsedMaxRetryAttempts;
+            } else {
+                console.warn(
+                    `[${new Date().toISOString()}] ⚠️  MAX_RETRY_ATTEMPTS must be a non-negative integer, using default`
+                );
+                maxRetryAttempts = DEFAULT_MAX_RETRY_ATTEMPTS;
+            }
+        }
+    }
+
+    return {
+        blacklistPatterns: compilePatternList(blacklistUrls, "BLACKLIST_URLS"),
+        whitelistPatterns: compilePatternList(whitelistOrigins, "WHITELIST_ORIGINS"),
+        backupCorsServers,
+        maxRetryAttempts
+    };
+}
