@@ -153,13 +153,16 @@ wrangler secret delete BLACKLIST_URLS
     - Comma/newline-separated URLs
   - Smart routing: when a backup server succeeds, worker stores it in KV for 15 minutes per target domain and prioritizes it first during that window
   - Auto cleanup: stale preferred entries are deleted when the cached server is removed from `BACKUP_CORS_SERVERS` or when that preferred server fails (network error / retryable status)
-  - Used when direct destination fetch fails or returns retryable status (all `4xx` + `502`/`503`)
+  - Used when direct destination fetch fails or returns retryable status (`403`, `429`, `502`, `503`)
+  - Backup servers and the KV lookup are only touched after the direct attempt fails
   - Default: `[]` (disabled)
   - Legacy compatibility: `DEFAULT_BACKUP_CORS_SERVERS` is also accepted, but deprecated
 
 - **MAX_RETRY_ATTEMPTS**: Non-negative integer for retry count after the first direct attempt
   - Example: `3`
   - Default: `3`
+  - Every backup server is always tried once; this setting only controls extra repeats (with backoff) once all targets are exhausted
+  - Repeats against the same target are skipped for `403` responses and for non-idempotent methods (`POST`, `PATCH`), so those are never sent twice to the same server
 
 **Alternative: Environment Variables (wrangler.toml)**
 
@@ -438,8 +441,9 @@ fetch("https://your-worker.workers.dev/?url=https://api.example.com/resource/123
 - **URL Auto-normalization**: Automatically prepends `https://` to URLs without a protocol
 - **URL Validation**: Validates and normalizes target URLs before making requests
 - **Request Body Forwarding**: Properly forwards request bodies for POST, PUT, PATCH, and other methods
-- **Backup CORS Failover**: Retries with backup CORS servers when direct requests fail or return retryable status (all `4xx` + `502`/`503`)
-- **Backup Security Guard**: If request contains sensitive headers (e.g. `Authorization`, `Cookie`, `X-API-Key`), backup proxy path is blocked and returns `403`
+- **Streaming Responses**: Upstream bodies are streamed straight through (never buffered), so SSE, AI streaming APIs and large downloads work with low latency
+- **Backup CORS Failover**: Retries with backup CORS servers when direct requests fail or return retryable status (`403`, `429`, `502`, `503`)
+- **Backup Security Guard**: If request contains sensitive headers (`Authorization`, `Proxy-Authorization`, `X-API-Key`, `Api-Key`, `X-Auth-Token`, `X-Access-Token`), backup servers are skipped and only the direct target is used
   - Override: append `?allowSensitive=true` to allow backup usage even when sensitive headers exist
 - **All HTTP Methods**: Supports GET, POST, PUT, DELETE, PATCH, HEAD, and OPTIONS
 - **Preflight Caching**: Caches CORS preflight responses for 24 hours to reduce overhead

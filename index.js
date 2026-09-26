@@ -26,6 +26,17 @@ const DEFAULT_BACKUP_CORS_SERVERS = []; // backup CORS proxy servers
 const DEFAULT_MAX_RETRY_ATTEMPTS = 3; // number of retries after the initial direct attempt
 const DEFAULT_VERSION = PACKAGE_VERSION; // Version from package.json (auto-generated)
 const RETRYABLE_STATUS_CODES = new Set([403, 429, 502, 503]);
+// Methods that are safe to send to the same target more than once (RFC 9110 §9.2.2)
+const IDEMPOTENT_METHODS = new Set(["GET", "HEAD", "OPTIONS", "PUT", "DELETE"]);
+const CONFIG_ENV_KEYS = [
+    "BLACKLIST_URLS",
+    "WHITELIST_ORIGINS",
+    "BACKUP_CORS_SERVERS",
+    "DEFAULT_BACKUP_CORS_SERVERS",
+    "MAX_RETRY_ATTEMPTS"
+];
+let cachedConfig = null;
+let cachedConfigSource = null;
 const PREFERRED_BACKUP_TTL_SECONDS = 15 * 60; // 15 minutes
 const PREFERRED_BACKUP_KV_KEY_PREFIX = "backup-preference:";
 let backupServerRotationCursor = 0;
@@ -306,8 +317,9 @@ function normalizeBackupCorsServerEntries(parsedBackupServers) {
             ? trimmedTemplate
             : `https://${trimmedTemplate}`;
         const validationUrl = normalizedTemplate.replaceAll("{url}", "https://example.com");
+        let origin;
         try {
-            new URL(validationUrl);
+            origin = new URL(validationUrl).origin;
         } catch (e) {
             console.warn(
                 `[${new Date().toISOString()}] ⚠️  Skipping invalid backup server URL at index ${index}: ${sanitizeUrlForLog(
@@ -325,6 +337,7 @@ function normalizeBackupCorsServerEntries(parsedBackupServers) {
 
         normalizedServers.push({
             template: templateWithoutTrailingSlash,
+            origin,
             headers: normalizeBackupCorsHeaders(rawHeaders, index)
         });
     });
@@ -360,8 +373,41 @@ function normalizeBackupCorsServerEntries(parsedBackupServers) {
  *   MAX_RETRY_ATTEMPTS = '3'
  *
  * Secrets take precedence over vars if both are set.
+ *
+ * The parsed config is cached per isolate and reused until one of the raw env values changes,
+ * so JSON parsing, regex compilation and backup normalization happen once instead of per request.
  */
 function getConfig(env) {
+    const source = CONFIG_ENV_KEYS.map(key => env?.[key]);
+    if (
+        cachedConfig &&
+        cachedConfigSource.every((rawValue, index) => rawValue === source[index])
+    ) {
+        return cachedConfig;
+    }
+
+    cachedConfig = parseConfig(env);
+    cachedConfigSource = source;
+    return cachedConfig;
+}
+
+function compilePatternList(patterns, listName) {
+    const compiledPatterns = [];
+    for (const pattern of patterns) {
+        try {
+            compiledPatterns.push(pattern instanceof RegExp ? pattern : new RegExp(pattern));
+        } catch (e) {
+            console.warn(
+                `[${new Date().toISOString()}] ⚠️  Skipping invalid ${listName} pattern ${JSON.stringify(
+                    String(pattern)
+                )}: ${e.message}`
+            );
+        }
+    }
+    return compiledPatterns;
+}
+
+function parseConfig(env) {
     let blacklistUrls = DEFAULT_BLACKLIST_URLS;
     let whitelistOrigins = DEFAULT_WHITELIST_ORIGINS;
     const defaultNormalizedBackupCorsServers = normalizeBackupCorsServerEntries(
@@ -461,7 +507,12 @@ function getConfig(env) {
         }
     }
 
-    return { blacklistUrls, whitelistOrigins, backupCorsServers, maxRetryAttempts };
+    return {
+        blacklistPatterns: compilePatternList(blacklistUrls, "BLACKLIST_URLS"),
+        whitelistPatterns: compilePatternList(whitelistOrigins, "WHITELIST_ORIGINS"),
+        backupCorsServers,
+        maxRetryAttempts
+    };
 }
 
 function isRetryableStatusCode(statusCode) {
@@ -577,15 +628,6 @@ function pruneLocalCache() {
     }
 }
 
-function setLocalCache(key, value, ttlMillis) {
-    pruneLocalCache();
-    localBackupCache.set(key, {
-        value,
-        exp: Date.now() + ttlMillis,
-        kvValue: undefined  // tracks last-known KV value to skip redundant writes
-    });
-}
-
 /**
  * Set local cache with known KV value tracking.
  * This avoids redundant KV writes when the value hasn't changed.
@@ -597,16 +639,6 @@ function setLocalCacheWithKvTracking(key, value, ttlMillis, kvValue) {
         exp: Date.now() + ttlMillis,
         kvValue  // what we know is stored in KV
     });
-}
-
-function getLocalCache(key) {
-    const item = localBackupCache.get(key);
-    if (!item) return undefined;
-    if (Date.now() > item.exp) {
-        localBackupCache.delete(key);
-        return undefined;
-    }
-    return item.value;
 }
 
 /**
@@ -820,80 +852,115 @@ async function clearPreferredBackupServer(env, targetUrl, reason = "") {
 // 2. Using official APIs when available
 // 3. Deploying on platforms that support headless browsers (Vercel, AWS Lambda, etc.)
 
-// Function to check if a given URI or origin is listed in the whitelist or blacklist
-function matchesPatternList(uri, listing) {
+// Function to check if a given URI or origin matches one of the precompiled patterns
+function matchesPatternList(uri, patterns) {
     if (typeof uri === "string") {
-        return listing.some(pattern => uri.match(pattern) !== null);
+        return patterns.some(pattern => pattern.test(uri));
     }
     // When URI is null (e.g., when Origin header is missing), accept null origins
     return true;
 }
 
+// Request headers that must not be forwarded upstream
+const EXCLUDED_HEADER_PATTERNS = [/^origin/i, /^referer/i, /^cf-/, /^x-forw/i, /^x-cors-headers/i];
+
+// Realistic browser fingerprints to rotate through.
+// Referer and Sec-Fetch-Site are filled in per request by getBrowserHeaders.
+const BROWSER_FINGERPRINTS = [
+    {
+        // Chrome on Windows
+        "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        Accept:
+            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        Referer: null,
+        "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+        "Sec-Ch-Ua-Platform-Version": '"15.0.0"',
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": null,
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+        "Cache-Control": "max-age=0"
+    },
+    {
+        // Chrome on macOS
+        "User-Agent":
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        Accept:
+            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        Referer: null,
+        "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"macOS"',
+        "Sec-Ch-Ua-Platform-Version": '"15.0.0"',
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": null,
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+        "Cache-Control": "max-age=0"
+    },
+    {
+        // Firefox on Windows
+        "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+        Accept:
+            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate, br",
+        Referer: null,
+        DNT: "1",
+        Connection: "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": null,
+        "Sec-Fetch-User": "?1",
+        "Cache-Control": "max-age=0"
+    },
+    {
+        // Safari on macOS
+        "User-Agent":
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        Referer: null,
+        DNT: "1",
+        Connection: "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": null,
+        "Sec-Fetch-User": "?1",
+        "Cache-Control": "max-age=0"
+    }
+];
+
 /**
- * Check if a response should be streamed instead of buffered
- * Detects Server-Sent Events (SSE), chunked transfer encoding, and streaming content types
- * Supports AI model streaming APIs (OpenAI, Anthropic, etc.)
- *
- * @param {Response} response - The response to check
- * @param {Request} request - The original request (to check Accept headers and URL)
- * @param {string} targetUrl - The target URL being proxied (to check for streaming parameters)
- * @returns {boolean} - True if the response should be streamed
+ * Pick a browser fingerprint for the target URL (stable per URL) and fill in the
+ * per-request Referer and Sec-Fetch-Site values.
  */
-function shouldStreamResponse(response, request, targetUrl) {
-    // Skip streaming for preflight requests
-    if (request.method === "OPTIONS") {
-        return false;
+function getBrowserHeaders(targetUrl, originHeader) {
+    let hash = 0;
+    for (let i = 0; i < targetUrl.length; i++) {
+        hash = (hash << 5) - hash + targetUrl.charCodeAt(i);
     }
+    const fingerprint = BROWSER_FINGERPRINTS[Math.abs(hash) % BROWSER_FINGERPRINTS.length];
 
-    const contentType = response.headers.get("content-type") || "";
-    const transferEncoding = response.headers.get("transfer-encoding") || "";
-    const acceptHeader = request.headers.get("accept") || "";
-
-    // Check for Server-Sent Events (SSE) - common for AI streaming APIs
-    if (contentType.includes("text/event-stream")) {
-        return true;
-    }
-
-    // Check for chunked transfer encoding
-    if (transferEncoding.toLowerCase().includes("chunked")) {
-        return true;
-    }
-
-    // Check if client requested streaming (text/event-stream or streaming indicators)
-    if (acceptHeader.includes("text/event-stream")) {
-        return true;
-    }
-
-    // Check URL for streaming parameters (common in AI APIs)
-    if (targetUrl) {
-        try {
-            const url = new URL(targetUrl);
-            const streamParam = url.searchParams.get("stream");
-            if (streamParam === "true" || streamParam === "1") {
-                return true;
-            }
-        } catch (e) {
-            // If URL parsing fails, continue with other checks
-        }
-    }
-
-    // Check request body for streaming flags (for POST requests with JSON body)
-    // Note: This is a heuristic - we can't read the body without consuming it,
-    // so we check common patterns in headers
-    const contentEncoding = response.headers.get("content-encoding") || "";
-    if (contentEncoding.includes("chunked")) {
-        return true;
-    }
-
-    // Check for common AI streaming API content types
-    // OpenAI streaming: text/plain or text/event-stream
-    // Anthropic streaming: text/event-stream or application/x-ndjson
-    // Other APIs may use application/json with chunked encoding
-    if (contentType.includes("application/x-ndjson")) {
-        return true;
-    }
-
-    return false;
+    return {
+        ...fingerprint,
+        // Use the origin as referer, or a common search engine when there is none
+        Referer: originHeader || "https://www.google.com/",
+        "Sec-Fetch-Site": originHeader ? "cross-site" : "none"
+    };
 }
 
 // Module worker export - handles all incoming fetch requests
@@ -1070,14 +1137,15 @@ export default {
             }
         }
 
+        const isAllowedRequest =
+            Boolean(targetUrl) &&
+            !matchesPatternList(targetUrl, config.blacklistPatterns) &&
+            matchesPatternList(originHeader, config.whitelistPatterns);
+
         // Handle OPTIONS preflight requests early - don't forward to target URL
         if (isPreflightRequest) {
             // Validate origin and target URL exist
-            if (
-                targetUrl &&
-                !matchesPatternList(targetUrl, config.blacklistUrls) &&
-                matchesPatternList(originHeader, config.whitelistOrigins)
-            ) {
+            if (isAllowedRequest) {
                 const preflightHeaders = new Headers();
                 setupCORSHeaders(preflightHeaders);
 
@@ -1109,163 +1177,84 @@ export default {
             }
         }
 
-        if (
-            targetUrl &&
-            !matchesPatternList(targetUrl, config.blacklistUrls) &&
-            matchesPatternList(originHeader, config.whitelistOrigins)
-        ) {
-            // Fetch the target URL
-            const filteredHeaders = {};
-            const excludePatterns = [
-                /^origin/i,
-                /^referer/i,
-                /^cf-/,
-                /^x-forw/i,
-                /^x-cors-headers/i
-            ];
+        if (isAllowedRequest) {
+            // Start with browser-like headers, then the original request headers, then custom headers
+            const filteredHeaders = getBrowserHeaders(targetUrl, originHeader);
 
-            // Determine Sec-Fetch-Site based on origin
-            const secFetchSite = originHeader ? "cross-site" : "none";
-
-            // Generate a realistic referer (use a common search engine or the origin)
-            const referer = originHeader || "https://www.google.com/";
-
-            // Multiple realistic browser fingerprints to rotate through
-            const browserFingerprints = [
-                {
-                    // Chrome on Windows
-                    "User-Agent":
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                    Accept:
-                        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "Accept-Encoding": "gzip, deflate, br",
-                    Referer: referer,
-                    "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-                    "Sec-Ch-Ua-Mobile": "?0",
-                    "Sec-Ch-Ua-Platform": '"Windows"',
-                    "Sec-Ch-Ua-Platform-Version": '"15.0.0"',
-                    "Sec-Fetch-Dest": "document",
-                    "Sec-Fetch-Mode": "navigate",
-                    "Sec-Fetch-Site": secFetchSite,
-                    "Sec-Fetch-User": "?1",
-                    "Upgrade-Insecure-Requests": "1",
-                    "Cache-Control": "max-age=0"
-                },
-                {
-                    // Chrome on macOS
-                    "User-Agent":
-                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                    Accept:
-                        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "Accept-Encoding": "gzip, deflate, br",
-                    Referer: referer,
-                    "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-                    "Sec-Ch-Ua-Mobile": "?0",
-                    "Sec-Ch-Ua-Platform": '"macOS"',
-                    "Sec-Ch-Ua-Platform-Version": '"15.0.0"',
-                    "Sec-Fetch-Dest": "document",
-                    "Sec-Fetch-Mode": "navigate",
-                    "Sec-Fetch-Site": secFetchSite,
-                    "Sec-Fetch-User": "?1",
-                    "Upgrade-Insecure-Requests": "1",
-                    "Cache-Control": "max-age=0"
-                },
-                {
-                    // Firefox on Windows
-                    "User-Agent":
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
-                    Accept:
-                        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-                    "Accept-Language": "en-US,en;q=0.5",
-                    "Accept-Encoding": "gzip, deflate, br",
-                    Referer: referer,
-                    DNT: "1",
-                    Connection: "keep-alive",
-                    "Upgrade-Insecure-Requests": "1",
-                    "Sec-Fetch-Dest": "document",
-                    "Sec-Fetch-Mode": "navigate",
-                    "Sec-Fetch-Site": secFetchSite,
-                    "Sec-Fetch-User": "?1",
-                    "Cache-Control": "max-age=0"
-                },
-                {
-                    // Safari on macOS
-                    "User-Agent":
-                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
-                    Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "Accept-Encoding": "gzip, deflate, br",
-                    Referer: referer,
-                    DNT: "1",
-                    Connection: "keep-alive",
-                    "Upgrade-Insecure-Requests": "1",
-                    "Sec-Fetch-Dest": "document",
-                    "Sec-Fetch-Mode": "navigate",
-                    "Sec-Fetch-Site": secFetchSite,
-                    "Sec-Fetch-User": "?1",
-                    "Cache-Control": "max-age=0"
-                }
-            ];
-
-            // Randomly select a browser fingerprint (or use hash of target URL for consistency)
-            const fingerprintIndex =
-                Math.abs(
-                    targetUrl.split("").reduce((hash, char) => {
-                        return (hash << 5) - hash + char.charCodeAt(0);
-                    }, 0)
-                ) % browserFingerprints.length;
-
-            const defaultBrowserHeaders = browserFingerprints[fingerprintIndex];
-
-            // Start with default browser headers
-            Object.assign(filteredHeaders, defaultBrowserHeaders);
-
-            // Override with headers from the original request (except excluded ones)
-            for (const [key, value] of request.headers.entries()) {
-                if (!excludePatterns.some(pattern => pattern.test(key))) {
+            for (const [key, value] of request.headers) {
+                if (!EXCLUDED_HEADER_PATTERNS.some(pattern => pattern.test(key))) {
                     filteredHeaders[key] = value;
                 }
             }
 
-            // Custom headers override everything
             if (customHeaders !== null && typeof customHeaders === "object") {
                 Object.assign(filteredHeaders, customHeaders);
             }
 
             const requestMethod = request.method;
+            const normalizedMethod = requestMethod.toUpperCase();
 
             // Read body once so it can be replayed across retries and backup servers
-            const hasRequestBody = !["GET", "HEAD"].includes(requestMethod.toUpperCase());
+            const hasRequestBody = !["GET", "HEAD"].includes(normalizedMethod);
             const requestBody = hasRequestBody ? await request.arrayBuffer() : null;
 
-            // Build attempt sequence: direct target first, then backup CORS servers
-            const filteredBackupServers = config.backupCorsServers.filter(server => {
-                try {
-                    return (
-                        new URL(buildBackupTargetUrl(server.template, "https://example.com"))
-                            .origin !== originUrl.origin
-                    );
-                } catch (e) {
-                    return false;
+            // Sending the same request to the same target twice is only safe for idempotent methods.
+            // Non-idempotent methods (POST, PATCH) still fail over to other targets.
+            const canRepeatSameTarget = IDEMPOTENT_METHODS.has(normalizedMethod);
+
+            const candidateBackupServers = config.backupCorsServers.filter(
+                server => server.origin !== originUrl.origin
+            );
+            const sensitiveHeaders =
+                candidateBackupServers.length > 0
+                    ? getSensitiveHeadersForBackup(request, customHeaders)
+                    : [];
+
+            // The direct target is always tried first. Backup targets (and the KV lookup for the
+            // preferred backup) are only resolved once the direct attempt has failed.
+            const attemptTargets = [{ url: targetUrl, mode: "direct" }];
+            let backupTargetsResolved = false;
+
+            const resolveBackupTargets = async () => {
+                if (backupTargetsResolved) {
+                    return;
                 }
-            });
+                backupTargetsResolved = true;
 
-            let prioritizedBackupServers = [...filteredBackupServers];
-            let preferredBackupCacheHit = false;
-            let preferredBackupServer = null;
+                if (candidateBackupServers.length === 0) {
+                    return;
+                }
 
-            // Only read KV when backup servers are configured to avoid wasted I/O
-            if (filteredBackupServers.length > 0) {
-                preferredBackupServer = await getPreferredBackupServer(env, targetUrl, ctx);
+                if (sensitiveHeaders.length > 0) {
+                    if (!allowSensitiveBackup) {
+                        console.warn(
+                            `[${new Date().toISOString()}] 🚫 Backup servers skipped due to sensitive request headers: ${sensitiveHeaders.join(
+                                ", "
+                            )} | Target: ${sanitizeUrlForLog(targetUrl)}`
+                        );
+                        return;
+                    }
+
+                    console.warn(
+                        `[${new Date().toISOString()}] ⚠️  Sensitive headers allowed for backup because allowSensitive=true. Headers: ${sensitiveHeaders.join(
+                            ", "
+                        )} | Target: ${sanitizeUrlForLog(targetUrl)}`
+                    );
+                }
+
+                let prioritizedBackupServers = [...candidateBackupServers];
+                let preferredBackupCacheHit = false;
+                let preferredBackupServer = await getPreferredBackupServer(env, targetUrl, ctx);
+
                 if (preferredBackupServer) {
                     const preferredIndex = prioritizedBackupServers.findIndex(
                         server => server.template === preferredBackupServer
                     );
                     if (preferredIndex >= 0) {
-                        const preferredServerConfig = prioritizedBackupServers[preferredIndex];
-                        prioritizedBackupServers.splice(preferredIndex, 1);
+                        const [preferredServerConfig] = prioritizedBackupServers.splice(
+                            preferredIndex,
+                            1
+                        );
                         prioritizedBackupServers.unshift(preferredServerConfig);
                         preferredBackupCacheHit = true;
                     } else {
@@ -1279,46 +1268,60 @@ export default {
                         preferredBackupServer = null;
                     }
                 }
-            }
 
-            if (prioritizedBackupServers.length > 1) {
-                if (preferredBackupCacheHit) {
-                    const pinnedPreferredServer = prioritizedBackupServers[0];
-                    const nonPreferredServers = prioritizedBackupServers.slice(1);
+                if (prioritizedBackupServers.length > 1) {
+                    if (preferredBackupCacheHit) {
+                        const [pinnedPreferredServer, ...nonPreferredServers] =
+                            prioritizedBackupServers;
 
-                    if (nonPreferredServers.length > 1) {
+                        if (nonPreferredServers.length > 1) {
+                            const rotationStartIndex = getNextBackupRotationStart(
+                                nonPreferredServers.length
+                            );
+                            prioritizedBackupServers = [
+                                pinnedPreferredServer,
+                                ...rotateArray(nonPreferredServers, rotationStartIndex)
+                            ];
+                        }
+                    } else {
                         const rotationStartIndex = getNextBackupRotationStart(
-                            nonPreferredServers.length
+                            prioritizedBackupServers.length
                         );
-                        prioritizedBackupServers = [
-                            pinnedPreferredServer,
-                            ...rotateArray(nonPreferredServers, rotationStartIndex)
-                        ];
+                        prioritizedBackupServers = rotateArray(
+                            prioritizedBackupServers,
+                            rotationStartIndex
+                        );
                     }
-                } else {
-                    const rotationStartIndex = getNextBackupRotationStart(
-                        prioritizedBackupServers.length
-                    );
-                    prioritizedBackupServers = rotateArray(
-                        prioritizedBackupServers,
-                        rotationStartIndex
-                    );
                 }
-            }
 
-            let attemptTargets = [
-                { url: targetUrl, mode: "direct" },
-                ...prioritizedBackupServers.map(server => ({
-                    url: buildBackupTargetUrl(server.template, targetUrl),
-                    mode: "backup",
-                    backupServer: server.template,
-                    backupHeaders: server.headers,
-                    preferred:
-                        preferredBackupCacheHit &&
-                        Boolean(preferredBackupServer) &&
-                        server.template === preferredBackupServer
-                }))
-            ];
+                attemptTargets.push(
+                    ...prioritizedBackupServers.map(server => ({
+                        url: buildBackupTargetUrl(server.template, targetUrl),
+                        mode: "backup",
+                        backupServer: server.template,
+                        backupHeaders: server.headers,
+                        preferred:
+                            preferredBackupCacheHit && server.template === preferredBackupServer
+                    }))
+                );
+            };
+
+            // Decide whether another attempt should follow a failed one
+            const canAttemptAgain = (attemptIndex, failedStatus) => {
+                const nextAttemptIndex = attemptIndex + 1;
+                if (nextAttemptIndex < attemptTargets.length) {
+                    // An untried target is still available
+                    return true;
+                }
+
+                // Only repeats against the same target remain. A 403 is rarely transient,
+                // and non-idempotent methods must not be replayed against the same target.
+                if (!canRepeatSameTarget || failedStatus === 403) {
+                    return false;
+                }
+
+                return nextAttemptIndex <= config.maxRetryAttempts;
+            };
 
             const createAttemptRequest = attemptTarget => {
                 const attemptHeaders = { ...filteredHeaders };
@@ -1335,42 +1338,11 @@ export default {
             };
 
             try {
-                let lastNetworkError = null;
-
-                const sensitiveHeaders = getSensitiveHeadersForBackup(request, customHeaders);
-                const hasSensitiveHeaders = sensitiveHeaders.length > 0;
-                const hasBackupTargets = attemptTargets.some(t => t.mode === "backup");
-
-                // Check sensitive header restrictions once before entering the retry loop
-                if (hasBackupTargets && hasSensitiveHeaders && !allowSensitiveBackup) {
-                    // Strip all backup targets — only direct attempt is allowed
-                    const directOnly = attemptTargets.filter(t => t.mode === "direct");
-                    attemptTargets.length = 0;
-                    attemptTargets.push(...directOnly);
-
-                    console.warn(
-                        `[${new Date().toISOString()}] 🚫 Backup servers removed from attempt list due to sensitive request headers: ${sensitiveHeaders.join(
-                            ", "
-                        )} | Target: ${sanitizeUrlForLog(targetUrl)}`
-                    );
-                } else if (hasBackupTargets && hasSensitiveHeaders && allowSensitiveBackup) {
-                    console.warn(
-                        `[${new Date().toISOString()}] ⚠️  Sensitive headers allowed for backup because allowSensitive=true. Headers: ${sensitiveHeaders.join(
-                            ", "
-                        )} | Target: ${sanitizeUrlForLog(targetUrl)}`
-                    );
-                }
-
-                // Recalculate max attempts after potential target list trimming
-                const effectiveMaxAttempts = Math.max(
-                    Math.max(1, config.maxRetryAttempts + 1),
-                    attemptTargets.length
-                );
-
-                for (let attemptIndex = 0; attemptIndex < effectiveMaxAttempts; attemptIndex++) {
+                for (let attemptIndex = 0; ; attemptIndex++) {
                     const targetIndex = Math.min(attemptIndex, attemptTargets.length - 1);
                     const currentAttemptTarget = attemptTargets[targetIndex];
-                    const isLastAttempt = attemptIndex === effectiveMaxAttempts - 1;
+                    const isPreferredBackup =
+                        currentAttemptTarget.mode === "backup" && currentAttemptTarget.preferred;
 
                     if (currentAttemptTarget.mode === "backup") {
                         console.log(
@@ -1393,20 +1365,15 @@ export default {
                     try {
                         response = await fetch(createAttemptRequest(currentAttemptTarget));
                     } catch (error) {
-                        lastNetworkError = error;
-
                         console.warn(
                             `[${new Date().toISOString()}] ⚠️  Failed to reach ${
                                 currentAttemptTarget.mode === "direct" ? "target" : "backup"
                             } URL: ${sanitizeUrlForLog(currentAttemptTarget.url)} | Error: ${
                                 sanitizeLogValue(error.message)
-                            } | Attempt: ${attemptIndex + 1}/${effectiveMaxAttempts}`
+                            } | Attempt: ${attemptIndex + 1}`
                         );
 
-                        if (
-                            currentAttemptTarget.mode === "backup" &&
-                            currentAttemptTarget.preferred
-                        ) {
+                        if (isPreferredBackup) {
                             ctx.waitUntil(
                                 clearPreferredBackupServer(
                                     env,
@@ -1418,19 +1385,16 @@ export default {
                             );
                         }
 
-                        if (!isLastAttempt) {
+                        await resolveBackupTargets();
+                        if (canAttemptAgain(attemptIndex)) {
                             continue;
                         }
 
                         throw error;
                     }
 
-                    // Retry on selected upstream status codes
-                    if (isRetryableStatusCode(response.status) && !isLastAttempt) {
-                        if (
-                            currentAttemptTarget.mode === "backup" &&
-                            currentAttemptTarget.preferred
-                        ) {
+                    if (isRetryableStatusCode(response.status)) {
+                        if (isPreferredBackup) {
                             ctx.waitUntil(
                                 clearPreferredBackupServer(
                                     env,
@@ -1440,23 +1404,22 @@ export default {
                             );
                         }
 
-                        // Ensure body stream is closed before retrying
-                        if (response.body) {
-                            response.body.cancel();
+                        await resolveBackupTargets();
+                        if (canAttemptAgain(attemptIndex, response.status)) {
+                            // Ensure body stream is closed before retrying
+                            if (response.body) {
+                                response.body.cancel();
+                            }
+                            continue;
                         }
-                        continue;
-                    }
-
-                    if (currentAttemptTarget.mode === "backup") {
-                        if (!isRetryableStatusCode(response.status)) {
-                            ctx.waitUntil(
-                                setPreferredBackupServer(
-                                    env,
-                                    targetUrl,
-                                    currentAttemptTarget.backupServer
-                                )
-                            );
-                        }
+                    } else if (currentAttemptTarget.mode === "backup") {
+                        ctx.waitUntil(
+                            setPreferredBackupServer(
+                                env,
+                                targetUrl,
+                                currentAttemptTarget.backupServer
+                            )
+                        );
                     }
 
                     const responseHeaders = new Headers(response.headers);
@@ -1472,23 +1435,6 @@ export default {
                         JSON.stringify(allResponseHeaders)
                     );
 
-                    // Check if this is a streaming response (for AI model streaming, SSE, etc.)
-                    const isStreaming = shouldStreamResponse(response, request, targetUrl);
-
-                    // For streaming responses, pass through the stream directly
-                    // For non-streaming, buffer the response as before for backward compatibility
-                    let responseBody;
-                    if (isStreaming) {
-                        // Pass through the stream directly - don't buffer
-                        // This allows Server-Sent Events and chunked streaming to work properly
-                        responseBody = response.body;
-                    } else {
-                        // Buffer the response for non-streaming responses
-                        responseBody = await response.arrayBuffer();
-                    }
-
-                    const duration = Date.now() - startTime;
-
                     // Keep only essential upstream failure logs.
                     if (response.status >= 500) {
                         console.warn(
@@ -1496,19 +1442,18 @@ export default {
                                 targetUrl
                             )} | Status: ${response.status} ${
                                 response.statusText
-                            } | Duration: ${duration}ms | Method: ${request.method}`
+                            } | Duration: ${Date.now() - startTime}ms | Method: ${request.method}`
                         );
                     }
 
-                    return new Response(responseBody, {
+                    // Stream the body through instead of buffering it: lower time-to-first-byte,
+                    // bounded memory, and SSE / chunked responses keep working.
+                    return new Response(response.body, {
                         headers: responseHeaders,
                         status: response.status,
                         statusText: response.statusText
                     });
                 }
-
-                // Should never happen, but keep a deterministic fallback
-                throw lastNetworkError || new Error("All upstream attempts failed");
             } catch (error) {
                 const duration = Date.now() - startTime;
                 console.error(
@@ -1580,7 +1525,8 @@ export default {
                 "Backup:",
                 "BACKUP_CORS_SERVERS must contain {url} placeholder",
                 'Supports per-backup headers: {"url":"...","headers":{"x-cors-api-key":"..."}}',
-                "Retryable statuses: 403 + 502 + 503",
+                "Retryable statuses: 403 + 429 + 502 + 503",
+                "403 and POST/PATCH are never repeated against the same target",
                 "Backup servers rotate each request (preferred stays first, others rotate)",
                 "Successful backup is cached as preferred for 15 minutes per domain (KV)",
                 "Sensitive headers block backup by default (override with allowSensitive=true)",
