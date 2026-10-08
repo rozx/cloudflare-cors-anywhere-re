@@ -125,7 +125,7 @@ export default {
 
         if (!targetUrl) {
             if (originUrl.search) return errorResponse(request, 400, "Invalid target URL");
-            return renderInfoPage({ request, env, originUrl, customHeaders });
+            return renderInfoPage({ request, env, originUrl });
         }
 
         console.warn(

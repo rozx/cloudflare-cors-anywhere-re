@@ -126,13 +126,27 @@ test("supports the legacy ?{targetUrl} format", async () => {
     assert.equal(calls[0].url, "https://legacy.example/path");
 });
 
-test("shows the info page when no target URL is given", async () => {
-    const { response, calls } = await runWorker(new Request(`${WORKER_ORIGIN}/`), {}, () => {
-        throw new Error("should not fetch");
-    });
+test("info page shows the release version when Cloudflare deployment metadata is present", async () => {
+    const { response, calls } = await runWorker(
+        new Request(`${WORKER_ORIGIN}/`),
+        {
+            VERSION: "1.3.8",
+            CF_VERSION_METADATA: {
+                id: "6379f73b-101a-456f-ae3c-f98a259a87a2",
+                tag: "production",
+                timestamp: "2026-10-08T17:08:00.448Z"
+            }
+        },
+        () => {
+            throw new Error("should not fetch");
+        }
+    );
 
     assert.equal(response.status, 200);
-    assert.match(await response.text(), /CLOUDFLARE-CORS-ANYWHERE/);
+    const text = await response.text();
+    assert.match(text, /CLOUDFLARE-CORS-ANYWHERE/);
+    assert.match(text, /^Version: 1\.3\.8$/m);
+    assert.doesNotMatch(text, /6379f73b|Version ID:|Version Tag:/);
     assert.equal(calls.length, 0);
 });
 
