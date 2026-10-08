@@ -16,8 +16,6 @@ const text = await response.text();
 
 Use the target API's normal method, headers, and body for POST, PUT, PATCH, or DELETE requests. CORS preflights are handled automatically. The legacy `?{targetUrl}` format is also supported.
 
-Replace `https://your-worker.example` with your own deployment URL. Open that URL for usage instructions and the current release version. Browser-restricted request headers can be supplied as a JSON object in `x-cors-headers`.
-
 ## Limits and costs
 
 | Limit | Default |
