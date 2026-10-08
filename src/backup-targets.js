@@ -35,6 +35,7 @@ function getNextBackupRotationStart(totalServers) {
 
 export function getSensitiveHeadersForBackup(request, customHeaders) {
     const sensitiveHeaderNames = new Set([
+        "cookie",
         "authorization",
         "proxy-authorization",
         "x-api-key",

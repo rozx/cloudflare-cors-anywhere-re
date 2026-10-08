@@ -34,29 +34,58 @@ import { renderInfoPage } from "./src/info-page.js";
 import { sanitizeUrlForLog } from "./src/log-redaction.js";
 import { proxyRequest } from "./src/proxy.js";
 import { extractTargetUrl, parseCustomHeaders } from "./src/request-parsing.js";
+import {
+    ALLOWED_METHODS,
+    MAX_URL_LENGTH,
+    checkRateLimits,
+    errorResponse,
+    isAllowedTarget
+} from "./src/security.js";
 
 // Module worker export - handles all incoming fetch requests
 export default {
     async fetch(request, env, ctx) {
-        const startTime = Date.now();
+        const rateError = await checkRateLimits(request, env);
+        if (rateError) return rateError;
+        if (request.url.length > MAX_URL_LENGTH) return errorResponse(request, 414, "URL too long");
+        if (request.headers.has("x-cors-proxy-hop"))
+            return errorResponse(request, 403, "Proxy loop blocked");
+        if (request.headers.has("upgrade") || !ALLOWED_METHODS.includes(request.method)) {
+            return errorResponse(request, 405, "Unsupported method or protocol");
+        }
         const originUrl = new URL(request.url);
         const originHeader = request.headers.get("Origin");
 
         // Load configuration from environment variables (with fallback to defaults)
-        const config = getConfig(env);
+        let config;
+        try {
+            config = getConfig(env);
+        } catch {
+            return errorResponse(request, 503, "Invalid proxy configuration");
+        }
         const targetUrl = extractTargetUrl(originUrl);
-        const customHeaders = parseCustomHeaders(request);
+        let customHeaders;
+        try {
+            customHeaders = parseCustomHeaders(request);
+        } catch {
+            return errorResponse(request, 400, "Invalid custom headers");
+        }
 
         const isAllowedRequest =
             Boolean(targetUrl) &&
-            !matchesPatternList(targetUrl, config.blacklistPatterns) &&
+            isAllowedTarget(targetUrl, originUrl, config) &&
             matchesPatternList(originHeader, config.whitelistPatterns);
 
         // Handle OPTIONS preflight requests early - don't forward to target URL
         if (request.method === "OPTIONS") {
             const preflightHeaders = applyCorsHeaders(new Headers(), request);
 
-            if (isAllowedRequest) {
+            if (
+                isAllowedRequest &&
+                ALLOWED_METHODS.includes(
+                    request.headers.get("Access-Control-Request-Method") || "GET"
+                )
+            ) {
                 // Add Access-Control-Max-Age for preflight caching (24 hours)
                 // This allows browsers to cache the preflight response and avoid repeated OPTIONS requests
                 preflightHeaders.set("Access-Control-Max-Age", "86400");
@@ -90,12 +119,12 @@ export default {
                 config,
                 originUrl,
                 targetUrl,
-                customHeaders,
-                startTime
+                customHeaders
             });
         }
 
         if (!targetUrl) {
+            if (originUrl.search) return errorResponse(request, 400, "Invalid target URL");
             return renderInfoPage({ request, env, originUrl, customHeaders });
         }
 

@@ -4,14 +4,17 @@ import { sanitizeLogValue, sanitizeUrlForLog } from "./log-redaction.js";
 const DEFAULT_BLACKLIST_URLS = []; // regexp for blacklisted urls
 const DEFAULT_WHITELIST_ORIGINS = [".*"]; // regexp for whitelisted origins
 const DEFAULT_BACKUP_CORS_SERVERS = []; // backup CORS proxy servers
-const DEFAULT_MAX_RETRY_ATTEMPTS = 3; // number of retries after the initial direct attempt
+const DEFAULT_MAX_RETRY_ATTEMPTS = 0; // retries are opt-in for public deployments
 
 const CONFIG_ENV_KEYS = [
     "BLACKLIST_URLS",
     "WHITELIST_ORIGINS",
     "BACKUP_CORS_SERVERS",
     "DEFAULT_BACKUP_CORS_SERVERS",
-    "MAX_RETRY_ATTEMPTS"
+    "MAX_RETRY_ATTEMPTS",
+    "ENABLE_BACKUP_FALLBACK",
+    "ENABLE_BACKUP_KV",
+    "ALLOWED_TARGET_HOSTS"
 ];
 let cachedConfig = null;
 let cachedConfigSource = null;
@@ -103,8 +106,8 @@ function normalizeBackupCorsServerEntries(parsedBackupServers) {
                 typeof serverEntry.url === "string"
                     ? serverEntry.url
                     : typeof serverEntry.server === "string"
-                    ? serverEntry.server
-                    : "";
+                      ? serverEntry.server
+                      : "";
             rawHeaders = serverEntry.headers;
         } else {
             return;
@@ -172,7 +175,7 @@ function normalizeBackupCorsServerEntries(parsedBackupServers) {
  *   BLACKLIST_URLS = '["^https?://malicious\\.com"]'
  *   WHITELIST_ORIGINS = '["^https://example\\.com$"]'
  *   BACKUP_CORS_SERVERS = '["https://backup-1.workers.dev/?url={url}", {"url":"https://backup-2.workers.dev/?url={url}","headers":{"x-cors-api-key":"token"}}]'
- *   MAX_RETRY_ATTEMPTS = '3'
+ *   MAX_RETRY_ATTEMPTS = '0'
  *
  * Secrets take precedence over vars if both are set.
  *
@@ -181,10 +184,7 @@ function normalizeBackupCorsServerEntries(parsedBackupServers) {
  */
 export function getConfig(env) {
     const source = CONFIG_ENV_KEYS.map(key => env?.[key]);
-    if (
-        cachedConfig &&
-        cachedConfigSource.every((rawValue, index) => rawValue === source[index])
-    ) {
+    if (cachedConfig && cachedConfigSource.every((rawValue, index) => rawValue === source[index])) {
         return cachedConfig;
     }
 
@@ -196,17 +196,25 @@ export function getConfig(env) {
 function compilePatternList(patterns, listName) {
     const compiledPatterns = [];
     for (const pattern of patterns) {
-        try {
-            compiledPatterns.push(pattern instanceof RegExp ? pattern : new RegExp(pattern));
-        } catch (e) {
-            console.warn(
-                `[${new Date().toISOString()}] ⚠️  Skipping invalid ${listName} pattern ${JSON.stringify(
-                    String(pattern)
-                )}: ${e.message}`
-            );
+        if (typeof pattern !== "string" || pattern.length > 256) {
+            throw new Error(`Invalid ${listName} pattern`);
         }
+        compiledPatterns.push(new RegExp(pattern));
     }
     return compiledPatterns;
+}
+
+function parseList(raw, fallback) {
+    if (raw === undefined) return fallback;
+    const parsed = JSON.parse(raw);
+    if (
+        !Array.isArray(parsed) ||
+        parsed.length > 100 ||
+        parsed.some(value => typeof value !== "string")
+    ) {
+        throw new Error("Expected a configuration array of strings");
+    }
+    return parsed;
 }
 
 function parseConfig(env) {
@@ -220,45 +228,9 @@ function parseConfig(env) {
 
     // Try to read from environment variables
     if (env) {
-        // Parse blacklistUrls from env var (JSON array)
-        if (env.BLACKLIST_URLS) {
-            try {
-                blacklistUrls = JSON.parse(env.BLACKLIST_URLS);
-                if (!Array.isArray(blacklistUrls)) {
-                    console.warn(
-                        `[${new Date().toISOString()}] ⚠️  BLACKLIST_URLS must be a JSON array, using default`
-                    );
-                    blacklistUrls = DEFAULT_BLACKLIST_URLS;
-                }
-            } catch (e) {
-                console.warn(
-                    `[${new Date().toISOString()}] ⚠️  Failed to parse BLACKLIST_URLS from env: ${
-                        e.message
-                    }, using default`
-                );
-                blacklistUrls = DEFAULT_BLACKLIST_URLS;
-            }
-        }
-
-        // Parse whitelistOrigins from env var (JSON array)
-        if (env.WHITELIST_ORIGINS) {
-            try {
-                whitelistOrigins = JSON.parse(env.WHITELIST_ORIGINS);
-                if (!Array.isArray(whitelistOrigins)) {
-                    console.warn(
-                        `[${new Date().toISOString()}] ⚠️  WHITELIST_ORIGINS must be a JSON array, using default`
-                    );
-                    whitelistOrigins = DEFAULT_WHITELIST_ORIGINS;
-                }
-            } catch (e) {
-                console.warn(
-                    `[${new Date().toISOString()}] ⚠️  Failed to parse WHITELIST_ORIGINS from env: ${
-                        e.message
-                    }, using default`
-                );
-                whitelistOrigins = DEFAULT_WHITELIST_ORIGINS;
-            }
-        }
+        // Invalid access rules fail closed; never fall back to public access.
+        blacklistUrls = parseList(env.BLACKLIST_URLS, DEFAULT_BLACKLIST_URLS);
+        whitelistOrigins = parseList(env.WHITELIST_ORIGINS, DEFAULT_WHITELIST_ORIGINS);
 
         // Parse backup CORS servers from env var (JSON array)
         // Supports both BACKUP_CORS_SERVERS (preferred) and legacy DEFAULT_BACKUP_CORS_SERVERS.
@@ -297,9 +269,9 @@ function parseConfig(env) {
 
         // Parse max retry attempts from env var (non-negative integer)
         if (env.MAX_RETRY_ATTEMPTS !== undefined) {
-            const parsedMaxRetryAttempts = Number.parseInt(env.MAX_RETRY_ATTEMPTS, 10);
+            const parsedMaxRetryAttempts = Number(env.MAX_RETRY_ATTEMPTS);
             if (Number.isInteger(parsedMaxRetryAttempts) && parsedMaxRetryAttempts >= 0) {
-                maxRetryAttempts = parsedMaxRetryAttempts;
+                maxRetryAttempts = Math.min(parsedMaxRetryAttempts, 2);
             } else {
                 console.warn(
                     `[${new Date().toISOString()}] ⚠️  MAX_RETRY_ATTEMPTS must be a non-negative integer, using default`
@@ -312,7 +284,16 @@ function parseConfig(env) {
     return {
         blacklistPatterns: compilePatternList(blacklistUrls, "BLACKLIST_URLS"),
         whitelistPatterns: compilePatternList(whitelistOrigins, "WHITELIST_ORIGINS"),
-        backupCorsServers,
+        backupCorsServers:
+            env?.ENABLE_BACKUP_FALLBACK === "true" ? backupCorsServers.slice(0, 2) : [],
+        enableBackupKv: env?.ENABLE_BACKUP_KV === "true",
+        allowedTargetHosts: parseList(env?.ALLOWED_TARGET_HOSTS, []).map(host => {
+            const normalized = host.toLowerCase().replace(/\.$/, "");
+            if (!/^[a-z0-9.-]+$/.test(normalized) || !normalized.includes(".")) {
+                throw new Error("Invalid ALLOWED_TARGET_HOSTS entry");
+            }
+            return normalized;
+        }),
         maxRetryAttempts
     };
 }

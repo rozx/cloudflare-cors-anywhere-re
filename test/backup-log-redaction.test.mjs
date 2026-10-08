@@ -33,9 +33,18 @@ test("redacts backup server query secrets from backup logs", async () => {
         const response = await worker.fetch(
             new Request("https://worker.example/?url=https%3A%2F%2Fapi.example%2Fdata"),
             {
-                BACKUP_CORS_SERVERS: JSON.stringify([
-                    "http://aaa.com?key=apikey&url={url}"
-                ]),
+                PROXY_RATE_LIMITER: {
+                    async limit() {
+                        return { success: true };
+                    }
+                },
+                PROXY_GLOBAL_LIMITER: {
+                    async limit() {
+                        return { success: true };
+                    }
+                },
+                ENABLE_BACKUP_FALLBACK: "true",
+                BACKUP_CORS_SERVERS: JSON.stringify(["http://aaa.com?key=apikey&url={url}"]),
                 MAX_RETRY_ATTEMPTS: "0"
             },
             { waitUntil: () => {} }
@@ -56,6 +65,6 @@ test("redacts backup server query secrets from backup logs", async () => {
     assert.match(joinedLogs, /Failed to reach backup URL:/);
     assert.match(joinedLogs, /key=\[REDACTED\]/);
     assert.doesNotMatch(joinedLogs, /apikey/);
-    assert.match(responseBody, /key=\[REDACTED\]/);
+    assert.equal(responseBody, "Unable to fetch target URL");
     assert.doesNotMatch(responseBody, /apikey/);
 });

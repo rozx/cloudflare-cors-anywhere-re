@@ -5,11 +5,26 @@ workers_dev = false
 preview_urls = false
 keep_vars = true  # Preserve remote environment variables from Cloudflare Dashboard
 
+[vars]
+ENABLE_BACKUP_FALLBACK = "false"
+ENABLE_BACKUP_KV = "false"
+MAX_RETRY_ATTEMPTS = "0"
 
-# Enable logging/observability (free tier: 200,000 log events/day with 3-day retention)
+
+# Public traffic must not generate retained logs or expose target query credentials.
 [observability]
-enabled = true
-head_sampling_rate = 1 # 100% of requests are logged (1 = 100%)
+enabled = false
+
+# Approximate limits per Cloudflare location. These are not billing caps.
+[[ratelimits]]
+name = "PROXY_RATE_LIMITER"
+namespace_id = "1001"
+simple = { limit = 60, period = 60 }
+
+[[ratelimits]]
+name = "PROXY_GLOBAL_LIMITER"
+namespace_id = "1002"
+simple = { limit = 300, period = 60 }
 
 # Version Metadata binding - provides access to deployment version information
 # This enables Cloudflare's built-in version metadata (id, tag, timestamp)
@@ -17,6 +32,5 @@ head_sampling_rate = 1 # 100% of requests are logged (1 = 100%)
 [version_metadata]
 binding = "CF_VERSION_METADATA"
 
-# KV binding for preferred backup server cache (15-minute TTL per target domain)
-[[kv_namespaces]]
-binding = "BACKUP_SERVER_CACHE"
+# No KV binding in the public/free deployment. Backup caching is memory-only.
+# Paid-plan CPU limits are intentionally omitted; Workers Free enforces 10 ms.

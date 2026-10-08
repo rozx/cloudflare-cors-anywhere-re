@@ -14,10 +14,7 @@ export function extractTargetUrl(originUrl) {
 
             // If we have multiple keys and the first one looks like it might be part of a URL,
             // try to reconstruct the URL from the parsed parameters
-            if (
-                paramKeys.length > 1 ||
-                (paramKeys.length === 1 && !searchString.includes("="))
-            ) {
+            if (paramKeys.length > 1 || (paramKeys.length === 1 && !searchString.includes("="))) {
                 // Try to reconstruct URL from nested query params (e.g., "https://api": {"moonshot": {"ai/models": ""}})
                 // This is a fallback - ideally URLs should be URL-encoded
                 let reconstructed = "";
@@ -83,7 +80,11 @@ export function extractTargetUrl(originUrl) {
 
             // Strict validation to block scanner requests and malformed URLs
             // Must contain a dot (domain/IPv4), or be an IPv6 address, or be localhost
-            if (!hn.includes(".") && hn !== "localhost" && !(hn.startsWith("[") && hn.endsWith("]"))) {
+            if (
+                !hn.includes(".") &&
+                hn !== "localhost" &&
+                !(hn.startsWith("[") && hn.endsWith("]"))
+            ) {
                 throw new Error("Hostname requires a valid domain or IP");
             }
             if (hn.includes("=") || hn.includes("&") || hn.includes("%")) {
@@ -107,16 +108,21 @@ export function extractTargetUrl(originUrl) {
 
 // Parse custom headers (used in both proxy and info page)
 export function parseCustomHeaders(request) {
-    let customHeaders = request.headers.get("x-cors-headers");
-    if (customHeaders !== null) {
-        try {
-            customHeaders = JSON.parse(customHeaders);
-        } catch (e) {
-            console.warn(
-                `[${new Date().toISOString()}] ⚠️  Failed to parse x-cors-headers: ${e.message}`
-            );
-        }
+    const raw = request.headers.get("x-cors-headers");
+    if (raw === null) return null;
+    if (raw.length > 8192) throw new Error("Custom headers too large");
+    const parsed = JSON.parse(raw);
+    if (
+        !parsed ||
+        typeof parsed !== "object" ||
+        Array.isArray(parsed) ||
+        Object.keys(parsed).length > 32
+    ) {
+        throw new Error("Custom headers must be an object");
     }
-
-    return customHeaders;
+    for (const [key, value] of Object.entries(parsed)) {
+        if (typeof value !== "string") throw new Error("Header values must be strings");
+        new Headers([[key, value]]); // Validate names and values before fetching.
+    }
+    return parsed;
 }

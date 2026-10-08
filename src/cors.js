@@ -3,12 +3,16 @@ export function matchesPatternList(uri, patterns) {
     if (typeof uri === "string") {
         return patterns.some(pattern => pattern.test(uri));
     }
-    // When URI is null (e.g., when Origin header is missing), accept null origins
-    return true;
+    // A missing Origin is allowed only by an explicitly public rule such as ".*".
+    return patterns.some(pattern => pattern.test(""));
 }
 
 // Function to modify headers to enable CORS
 export function applyCorsHeaders(headers, request) {
+    headers.set("Cache-Control", "no-store");
+    headers.set("X-Content-Type-Options", "nosniff");
+    headers.set("Content-Security-Policy", "sandbox; default-src 'none'; frame-ancestors 'none'");
+    headers.append("Vary", "Origin");
     const origin = request.headers.get("Origin");
     if (origin) {
         // Use the specific origin (not *) to allow credentials
@@ -21,7 +25,7 @@ export function applyCorsHeaders(headers, request) {
         // For same-origin requests, CORS headers aren't strictly necessary,
         // but we set them anyway for consistency
         headers.set("Access-Control-Allow-Origin", "*");
-        // Cannot use credentials with wildcard origin per CORS spec
+        headers.delete("Access-Control-Allow-Credentials");
     }
 
     if (request.method === "OPTIONS") {
@@ -42,8 +46,6 @@ export function applyCorsHeaders(headers, request) {
                 "Content-Type, Authorization, X-Requested-With, Accept, Origin"
             );
         }
-
-        headers.delete("X-Content-Type-Options"); // Remove X-Content-Type-Options header
     }
     return headers;
 }

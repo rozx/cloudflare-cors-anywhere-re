@@ -3,6 +3,13 @@ import test from "node:test";
 
 import worker from "../index.js";
 
+const responses = [];
+test.afterEach(async () => {
+    for (const response of responses.splice(0)) {
+        if (response.body && !response.body.locked) await response.body.cancel().catch(() => {});
+    }
+});
+
 const WORKER_ORIGIN = "https://worker.example";
 
 function proxyUrl(targetUrl, extraQuery = "") {
@@ -47,8 +54,7 @@ async function runWorker(request, env, handler) {
     const ctx = createCtx();
 
     globalThis.fetch = async upstreamRequest => {
-        const body =
-            upstreamRequest.body === null ? null : await upstreamRequest.clone().text();
+        const body = upstreamRequest.body === null ? null : await upstreamRequest.clone().text();
         calls.push({
             url: upstreamRequest.url,
             method: upstreamRequest.method,
@@ -62,7 +68,24 @@ async function runWorker(request, env, handler) {
     console.error = (...args) => logs.push(args.join(" "));
 
     try {
-        const response = await worker.fetch(request, env, ctx);
+        const response = await worker.fetch(
+            request,
+            {
+                PROXY_RATE_LIMITER: {
+                    async limit() {
+                        return { success: true };
+                    }
+                },
+                PROXY_GLOBAL_LIMITER: {
+                    async limit() {
+                        return { success: true };
+                    }
+                },
+                ...env
+            },
+            ctx
+        );
+        responses.push(response);
         await ctx.flush();
         return { response, calls, logs };
     } finally {
@@ -85,10 +108,7 @@ test("proxies a direct request and adds CORS headers", async () => {
     assert.equal(response.headers.get("access-control-allow-origin"), "https://app.example");
     assert.equal(response.headers.get("access-control-allow-credentials"), "true");
     assert.match(response.headers.get("access-control-expose-headers"), /x-upstream/);
-    assert.equal(
-        JSON.parse(response.headers.get("cors-received-headers"))["x-upstream"],
-        "yes"
-    );
+    assert.equal(JSON.parse(response.headers.get("cors-received-headers"))["x-upstream"], "yes");
     assert.equal(calls.length, 1);
     assert.equal(calls[0].url, "https://direct.example/data");
     assert.equal(calls[0].headers.get("x-custom"), "1");
@@ -201,6 +221,8 @@ test("does not read KV when the direct attempt succeeds", async () => {
     const { response, calls } = await runWorker(
         new Request(proxyUrl("https://no-kv.example/")),
         {
+            ENABLE_BACKUP_FALLBACK: "true",
+            ENABLE_BACKUP_KV: "true",
             BACKUP_CORS_SERVERS: JSON.stringify(["https://backup-a.example/?url={url}"]),
             BACKUP_SERVER_CACHE: kv
         },
@@ -217,6 +239,8 @@ test("fails over to a backup server and caches it as preferred", async () => {
     const { response, calls } = await runWorker(
         new Request(proxyUrl("https://failover.example/data?x=1")),
         {
+            ENABLE_BACKUP_FALLBACK: "true",
+            ENABLE_BACKUP_KV: "true",
             BACKUP_CORS_SERVERS: JSON.stringify([
                 { url: "https://backup-a.example/?url={url}", headers: { "x-key": "k" } }
             ]),
@@ -249,6 +273,8 @@ test("tries the KV-preferred backup server first", async () => {
     const { calls } = await runWorker(
         new Request(proxyUrl("https://preferred.example/")),
         {
+            ENABLE_BACKUP_FALLBACK: "true",
+            ENABLE_BACKUP_KV: "true",
             BACKUP_CORS_SERVERS: JSON.stringify([
                 "https://backup-a.example/?url={url}",
                 "https://backup-b.example/?url={url}"
@@ -270,6 +296,8 @@ test("skips backup servers and KV when sensitive headers are present", async () 
             headers: { Authorization: "Bearer secret" }
         }),
         {
+            ENABLE_BACKUP_FALLBACK: "true",
+            ENABLE_BACKUP_KV: "true",
             BACKUP_CORS_SERVERS: JSON.stringify(["https://backup-a.example/?url={url}"]),
             BACKUP_SERVER_CACHE: kv,
             MAX_RETRY_ATTEMPTS: "0"
@@ -288,6 +316,8 @@ test("uses backup servers with sensitive headers when allowSensitive=true", asyn
             headers: { Authorization: "Bearer secret" }
         }),
         {
+            ENABLE_BACKUP_FALLBACK: "true",
+            ENABLE_BACKUP_KV: "true",
             BACKUP_CORS_SERVERS: JSON.stringify(["https://backup-a.example/?url={url}"]),
             MAX_RETRY_ATTEMPTS: "0"
         },
@@ -335,13 +365,15 @@ test("does not repeat a POST against the same target", async () => {
     assert.equal(calls.length, 1);
 });
 
-test("fails a POST over to a backup server with the body replayed", async () => {
+test("does not replay a POST through a backup server", async () => {
     const { response, calls } = await runWorker(
         new Request(proxyUrl("https://post-failover.example/"), {
             method: "POST",
             body: "payload"
         }),
         {
+            ENABLE_BACKUP_FALLBACK: "true",
+            ENABLE_BACKUP_KV: "true",
             BACKUP_CORS_SERVERS: JSON.stringify(["https://backup-a.example/?url={url}"]),
             MAX_RETRY_ATTEMPTS: "3"
         },
@@ -349,17 +381,17 @@ test("fails a POST over to a backup server with the body replayed", async () => 
             callNumber === 1 ? new Response("rate", { status: 429 }) : new Response("ok")
     );
 
-    assert.equal(response.status, 200);
-    assert.equal(calls.length, 2);
+    assert.equal(response.status, 429);
+    assert.equal(calls.length, 1);
     assert.equal(calls[0].body, "payload");
-    assert.equal(calls[1].body, "payload");
-    assert.equal(calls[1].method, "POST");
 });
 
 test("skips backup servers that point back at this worker", async () => {
     const { response, calls } = await runWorker(
         new Request(proxyUrl("https://self-loop.example/")),
         {
+            ENABLE_BACKUP_FALLBACK: "true",
+            ENABLE_BACKUP_KV: "true",
             BACKUP_CORS_SERVERS: JSON.stringify([`${WORKER_ORIGIN}/?url={url}`]),
             MAX_RETRY_ATTEMPTS: "0"
         },
@@ -374,6 +406,8 @@ test("returns 502 when every attempt fails with a network error", async () => {
     const { response, calls } = await runWorker(
         new Request(proxyUrl("https://unreachable.example/")),
         {
+            ENABLE_BACKUP_FALLBACK: "true",
+            ENABLE_BACKUP_KV: "true",
             BACKUP_CORS_SERVERS: JSON.stringify(["https://backup-a.example/?url={url}"]),
             MAX_RETRY_ATTEMPTS: "0"
         },

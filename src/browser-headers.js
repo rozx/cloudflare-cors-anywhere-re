@@ -7,7 +7,14 @@
 // 3. Deploying on platforms that support headless browsers (Vercel, AWS Lambda, etc.)
 
 // Request headers that must not be forwarded upstream
-const EXCLUDED_HEADER_PATTERNS = [/^origin/i, /^referer/i, /^cf-/, /^x-forw/i, /^x-cors-headers/i];
+const EXCLUDED_HEADER_PATTERNS = [
+    /^origin$/i,
+    /^referer$/i,
+    /^cf-/i,
+    /^x-forw/i,
+    /^x-cors-/i,
+    /^(host|connection|content-length|transfer-encoding|upgrade|proxy-authorization|proxy-connection|keep-alive|te|trailer)$/i
+];
 
 // Realistic browser fingerprints to rotate through.
 // Referer and Sec-Fetch-Site are filled in per request by getBrowserHeaders.
@@ -16,8 +23,7 @@ const BROWSER_FINGERPRINTS = [
         // Chrome on Windows
         "User-Agent":
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        Accept:
-            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate, br",
         Referer: null,
@@ -36,8 +42,7 @@ const BROWSER_FINGERPRINTS = [
         // Chrome on macOS
         "User-Agent":
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        Accept:
-            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate, br",
         Referer: null,
@@ -56,8 +61,7 @@ const BROWSER_FINGERPRINTS = [
         // Firefox on Windows
         "User-Agent":
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
-        Accept:
-            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.5",
         "Accept-Encoding": "gzip, deflate, br",
         Referer: null,
@@ -113,17 +117,19 @@ function getBrowserHeaders(targetUrl, originHeader) {
  * headers (minus excluded ones), then x-cors-headers overrides.
  */
 export function buildUpstreamHeaders(request, targetUrl, customHeaders) {
-    const upstreamHeaders = getBrowserHeaders(targetUrl, request.headers.get("Origin"));
-
-    for (const [key, value] of request.headers) {
-        if (!EXCLUDED_HEADER_PATTERNS.some(pattern => pattern.test(key))) {
-            upstreamHeaders[key] = value;
+    const upstreamHeaders = new Headers(
+        getBrowserHeaders(targetUrl, request.headers.get("Origin"))
+    );
+    const add = entries => {
+        for (const [key, value] of entries) {
+            if (!EXCLUDED_HEADER_PATTERNS.some(pattern => pattern.test(key))) {
+                upstreamHeaders.set(key, value);
+            }
         }
-    }
-
-    if (customHeaders !== null && typeof customHeaders === "object") {
-        Object.assign(upstreamHeaders, customHeaders);
-    }
-
+    };
+    add(request.headers);
+    if (customHeaders) add(Object.entries(customHeaders));
+    upstreamHeaders.delete("connection");
+    upstreamHeaders.set("x-cors-proxy-hop", "1");
     return upstreamHeaders;
 }

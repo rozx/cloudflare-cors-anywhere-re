@@ -57,23 +57,25 @@ export function renderInfoPage({ request, env, originUrl, customHeaders }) {
         "Backup:",
         "BACKUP_CORS_SERVERS must contain {url} placeholder",
         'Supports per-backup headers: {"url":"...","headers":{"x-cors-api-key":"..."}}',
-        "Retryable statuses: 403 + 429 + 502 + 503",
-        "403 and POST/PATCH are never repeated against the same target",
+        "Backups require ENABLE_BACKUP_FALLBACK=true (disabled by default)",
+        "Retryable statuses: 403 + 502 + 503 (GET/HEAD only)",
+        "Writes are never replayed; upstream 429 responses are never retried",
         "Backup servers rotate each request (preferred stays first, others rotate)",
-        "Successful backup is cached as preferred for 15 minutes per domain (KV)",
+        "Preferred backup cache is memory-only unless ENABLE_BACKUP_KV=true",
         "Sensitive headers block backup by default (override with allowSensitive=true)",
         "",
-        "Limits: 100,000 requests/day",
-        "          1,000 requests/10 minutes",
+        "Limits: rate limiting is configured by the operator, per Cloudflare location",
+        "          1 MiB upload, 10 MiB download, 30 seconds total duration",
+        "          at most 3 upstream fetches including redirects and backups",
+        "Workers Free: Cloudflare enforces an account-wide daily request quota",
+        "Public access cannot guarantee freedom from abuse or quota exhaustion",
         "",
         ...(originHeader ? [`Origin: ${originHeader}`] : []),
         `IP: ${connectingIp || "unknown"}`,
         ...(country ? [`Country: ${country}`] : []),
         ...(colo ? [`Datacenter: ${colo}`] : []),
         "",
-        ...(customHeaders !== null
-            ? [`x-cors-headers: ${JSON.stringify(customHeaders)}`]
-            : [])
+        ...(customHeaders !== null ? [`x-cors-headers: ${JSON.stringify(customHeaders)}`] : [])
     ].join("\n");
 
     return new Response(infoText, {

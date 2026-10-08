@@ -22,6 +22,33 @@ https://github.com/rozx/cloudflare-cors-anywhere
 Original source:
 https://github.com/Zibri/cloudflare-cors-anywhere
 
+## Public access and cost protection
+
+This is a public proxy. It cannot guarantee that nobody abuses it. The no-usage-charge deployment assumes the **Cloudflare account is on Workers Free**, not merely that the domain is on a Free website plan. The plan is an account setting and cannot be pinned in this repository. Workers Free has an account-wide 100,000-request daily quota; exceeding it produces errors, not paid Worker overages. An attacker can still exhaust that quota and affect other Workers on the account. Configure Worker routes to **fail closed** so quota exhaustion cannot send traffic to an underlying origin. See [Cloudflare limits](https://developers.cloudflare.com/workers/platform/limits/) and [pricing](https://developers.cloudflare.com/workers/platform/pricing/).
+
+The checked-in public deployment has these protections:
+
+| Protection | Default |
+| --- | --- |
+| Per-client throttle | 60 requests/minute per IPv4 address or IPv6 /64, per Cloudflare location |
+| Shared throttle | 300 requests/minute per Cloudflare location |
+| Upload / response size | 1 MiB / 10 MiB, counting streamed bytes |
+| Total request duration | 30 seconds, including uploads and response streaming |
+| Upstream fetch budget | 3 total, including redirects, retries and backups |
+| Automatic retries | Off; only GET/HEAD can be retried when enabled |
+| Backup providers / persistent KV cache | Both off, with separate explicit opt-ins |
+| Retained Worker logs | Off |
+
+Rate limits cover preflights and the info page too. Missing or failed rate-limit bindings return 503. These counters are approximate and local to each Cloudflare location, **not a global quota or spending cap**. Shared networks may hit the client limit together, and distributed attacks may reach several locations. Assign the two `namespace_id` values uniquely within your account to avoid sharing counters with another Worker. See [rate-limit binding behavior](https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/).
+
+Only HTTP(S) DNS names on standard ports are accepted. IP literals, obvious local hostnames, URL credentials, direct self-proxy calls, and unsafe redirects are rejected. Redirects are checked at every hop; credentials are stripped on cross-origin redirects. This is URL validation, not DNS pinning or a complete SSRF boundary: arbitrary domains and aliases remain available by design. To restrict destinations, set `ALLOWED_TARGET_HOSTS` to a JSON array of exact hostnames. Do not give this Worker private-network/VPC bindings or access to internal services.
+
+Writes are never replayed to another server, upstream 429 responses are returned without retrying, and backup redirects are blocked. Proxied pages are sandboxed and cannot set cookies on the proxy origin. Responses are not cached. Streams exceeding the byte/time limit fail midstream after headers have been sent; long SSE sessions must reconnect within 30 seconds.
+
+Before deploying, verify Workers Free in the account dashboard, remove any paid backup credentials, and review retained Dashboard variables because `keep_vars = true` preserves them. Keep `ENABLE_BACKUP_FALLBACK` and `ENABLE_BACKUP_KV` unset or `false`. `workers_dev` and preview URLs are disabled; configure a custom domain or route and add an edge rate-limiting rule there to reject excess traffic before it invokes the Worker. The rule's availability and thresholds depend on the zone plan. Repository changes do not configure that rule or verify the live account.
+
+If the account is upgraded to Workers Paid, this project no longer provides a no-charge boundary. Worker-level rejections still execute the Worker; CPU limits and rate limits do not cap total request charges. [Budget alerts](https://developers.cloudflare.com/billing/manage/budget-alerts/) notify but do not stop spending. Third-party backups have their own billing independently of the Cloudflare plan.
+
 ## Deployment
 
 This project is written in [Cloudflare Workers](https://workers.cloudflare.com/), and can be easily deployed with [Wrangler CLI](https://developers.cloudflare.com/workers/wrangler/install-and-update/).
@@ -71,12 +98,11 @@ The `wrangler.toml` file contains the basic configuration:
 -   `name`: Your worker name (currently "cloudflare-cors-anywhere")
 -   `main`: Entry point file (index.js)
 -   `compatibility_date`: Cloudflare Workers API version
--   `observability`: Logging configuration (enabled by default with 100% sampling rate)
+-   `observability`: Retained logging disabled for the public deployment
+-   `ratelimits`: Required client and shared throttling bindings
 -   `version_metadata`: Version metadata binding for deployment tracking
 
-You can customize the worker name in `wrangler.toml` if desired. The observability section enables free logging with:
-- **Free Tier**: 200,000 log events per day with 3-day retention
-- **Sampling Rate**: 100% (all requests are logged)
+You can customize the worker name and rate-limit thresholds in `wrangler.toml`. These settings do not select the account's billing plan.
 
 #### Version Information
 
@@ -110,11 +136,11 @@ wrangler secret put WHITELIST_ORIGINS
 
 # Set backup CORS servers (JSON array of backup proxy URLs/config objects)
 wrangler secret put BACKUP_CORS_SERVERS
-# When prompted, paste: [{"url":"https://backup-1.workers.dev/?url={url}","headers":{"x-cors-api-key":"temp_cf7e8e6dd6b319e39385f2f9396804aa"}},"https://backup-2.workers.dev/?url={url}"]
+# When prompted, paste: [{"url":"https://backup-1.workers.dev/?url={url}","headers":{"x-cors-api-key":"YOUR_BACKUP_TOKEN"}},"https://backup-2.workers.dev/?url={url}"]
 
 # Set retry attempts after first try (non-negative integer)
 wrangler secret put MAX_RETRY_ATTEMPTS
-# When prompted, paste: 3
+# When prompted, paste: 0
 ```
 
 **View/Update Secrets:**
@@ -138,12 +164,26 @@ wrangler secret delete BLACKLIST_URLS
 
 - **WHITELIST_ORIGINS**: JSON array of regex patterns for allowed origins
   - Example: `["^https://myapp\\.com$", "^https://.*\\.myapp\\.com$"]`
-  - Default: `[".*"]` (all origins allowed)
+  - Default: `[".*"]` (all origins, including requests without Origin, allowed)
+  - Invalid access-rule JSON or regexes reject requests with 503
+  - A restrictive list also rejects a missing Origin unless a rule explicitly matches the empty string
+  - Origin headers are spoofable outside browsers; this is a CORS policy, not authentication
+
+- **ALLOWED_TARGET_HOSTS**: Optional JSON array of exact allowed destination hostnames (also checked on redirects)
+  - Example: `["api.example.com"]`
+  - Default: `[]` (any otherwise permitted public DNS name)
+
+- **ENABLE_BACKUP_FALLBACK**: Must be the string `true` to use configured backup servers
+  - Default: disabled, even if `BACKUP_CORS_SERVERS` exists in the Dashboard
+  - Enabling it exposes the owner's backup quota/credits to every public caller
+
+- **ENABLE_BACKUP_KV**: Must be the string `true` to use a `BACKUP_SERVER_CACHE` KV binding
+  - Default: disabled; the checked-in deployment has no KV binding
 
 - **BACKUP_CORS_SERVERS**: JSON array of backup CORS proxy server URL templates or config objects
   - Format: backup URL template must include `{url}` placeholder
   - String example: `"https://backup.server.com/?url={url}"`
-  - Object example (with backup-specific headers): `{"url":"https://backup.server.com/?url={url}","headers":{"x-cors-api-key":"temp_cf7e8e6dd6b319e39385f2f9396804aa"}}`
+  - Object example (with backup-specific headers): `{"url":"https://backup.server.com/?url={url}","headers":{"x-cors-api-key":"YOUR_BACKUP_TOKEN"}}`
   - Header behavior: object `headers` apply only when routing through that backup server
   - Also supports URL-encoded placeholder form: `%7Burl%7D`
   - Runtime behavior: worker replaces `{url}` with the actual target URL
@@ -151,18 +191,18 @@ wrangler secret delete BLACKLIST_URLS
     - JSON array (recommended): `["https://a/?url={url}",{"url":"https://b/?url={url}","headers":{"x-cors-api-key":"token"}}]`
     - Quoted list: `"https://a/?url={url}","https://b/?url={url}"`
     - Comma/newline-separated URLs
-  - Smart routing: when a backup server succeeds, worker stores it in KV for 15 minutes per target domain and prioritizes it first during that window
-  - Auto cleanup: stale preferred entries are deleted when the cached server is removed from `BACKUP_CORS_SERVERS` or when that preferred server fails (network error / retryable status)
-  - Used when direct destination fetch fails or returns retryable status (`403`, `429`, `502`, `503`)
+  - Smart routing: caches the preferred server in memory for 15 minutes; persistence requires explicit KV opt-in
+  - Auto cleanup: stale preferred entries are cleared when the cached server is removed from `BACKUP_CORS_SERVERS` or when that preferred server fails (network error / retryable status)
+  - Used when direct destination fetch fails or returns retryable status (`403`, `502`, `503`) for GET/HEAD only
   - Backup servers and the KV lookup are only touched after the direct attempt fails
   - Default: `[]` (disabled)
   - Legacy compatibility: `DEFAULT_BACKUP_CORS_SERVERS` is also accepted, but deprecated
 
 - **MAX_RETRY_ATTEMPTS**: Non-negative integer for retry count after the first direct attempt
-  - Example: `3`
-  - Default: `3`
-  - Every backup server is always tried once; this setting only controls extra repeats (with backoff) once all targets are exhausted
-  - Repeats against the same target are skipped for `403` responses and for non-idempotent methods (`POST`, `PATCH`), so those are never sent twice to the same server
+  - Example: `1`
+  - Default: `0`; values are clamped to at most `2`
+  - At most two configured backups participate. All redirects, backups and retries share a hard budget of three upstream fetches
+  - Only GET/HEAD may be retried or failed over. A 403 is never repeated against the same target; 429 is never retried
 
 **Alternative: Environment Variables (wrangler.toml)**
 
@@ -172,15 +212,16 @@ For non-sensitive configuration, you can use the `[vars]` section in `wrangler.t
 [vars]
 BLACKLIST_URLS = '["^https?://malicious\\.com"]'
 WHITELIST_ORIGINS = '["^https://example\\.com$"]'
-BACKUP_CORS_SERVERS = '[{"url":"https://backup-1.workers.dev/?url={url}","headers":{"x-cors-api-key":"temp_cf7e8e6dd6b319e39385f2f9396804aa"}},"https://backup-2.workers.dev/?url={url}"]'
-MAX_RETRY_ATTEMPTS = '3'
+BACKUP_CORS_SERVERS = '[{"url":"https://backup-1.workers.dev/?url={url}","headers":{"x-cors-api-key":"YOUR_BACKUP_TOKEN"}},"https://backup-2.workers.dev/?url={url}"]'
+MAX_RETRY_ATTEMPTS = '0'
 ```
 
-Also add a KV namespace binding (required for preferred-backup cache):
+Only if you deliberately enable persistent backup caching, add an existing KV namespace binding and set `ENABLE_BACKUP_KV=true`:
 
 ```toml
 [[kv_namespaces]]
 binding = "BACKUP_SERVER_CACHE"
+id = "YOUR_EXISTING_NAMESPACE_ID"
 ```
 
 **Note:** Secrets take precedence over `[vars]` if both are set.
@@ -210,7 +251,7 @@ binding = "BACKUP_SERVER_CACHE"
     wrangler publish
     ```
 
-2. **After deployment**, Wrangler will provide you with a URL like:
+2. **Configure a custom domain or route.** The checked-in configuration disables `workers.dev` and preview URLs. If you explicitly enable `workers.dev`, Wrangler provides a URL like:
     ```
     https://cloudflare-cors-anywhere.YOUR_SUBDOMAIN.workers.dev
     ```
@@ -230,7 +271,7 @@ If you want to use a custom domain:
 
 ### Verify Deployment
 
-Test your deployed worker by accessing it in a browser:
+Test your configured custom-domain URL in a browser. The `workers.dev` examples below apply only if that endpoint is explicitly enabled:
 
 ```
 https://YOUR_WORKER_NAME.YOUR_SUBDOMAIN.workers.dev
@@ -262,56 +303,7 @@ wrangler deploy
 
 ### Logging
 
-This project includes comprehensive logging that is **completely free** using Cloudflare Workers' built-in console logging. Logging is enabled in `wrangler.toml` via the `observability` section, which is configured to log 100% of requests.
-
-#### View Real-Time Logs
-
-Use Wrangler's tail command to view real-time logs from your deployed worker:
-
-```bash
-npm run logs
-```
-
-Or view logs in JSON format:
-
-```bash
-npm run logs:json
-```
-
-#### What Gets Logged
-
-The worker logs the following information:
-
-- **Request Information**: Method, path, origin, IP address, country, datacenter location
-- **Target URLs**: All proxy requests with target URLs
-- **Success Logs**: Successful requests with status codes and response times
-- **Error Logs**: Failed requests with detailed error messages and stack traces
-- **Info Requests**: When users access the info page
-- **Blocked Requests**: When requests are blocked by whitelist/blacklist rules
-
-#### View Logs in Cloudflare Dashboard
-
-1. Go to [Cloudflare Dashboard](https://dash.cloudflare.com/)
-2. Navigate to **Workers & Pages**
-3. Select your worker
-4. Click on **Logs** tab to view historical logs
-
-**Note**: Logs are available for free in the Cloudflare Dashboard. Real-time logs via `wrangler tail` are also free and show logs as they happen.
-
-#### Log Format
-
-Logs include timestamps (ISO format), emojis for easy visual scanning:
-- ✅ Success
-- ❌ Error
-- ⚠️ Warning
-- ℹ️ Info
-
-Example log output:
-```
-[2024-01-15T10:30:45.123Z] GET /?url=https://api.example.com/data | Origin: https://example.com | IP: 192.168.1.1 | Country: US | Colo: LAX
-[2024-01-15T10:30:45.456Z] Fetching target URL: https://api.example.com/data
-[2024-01-15T10:30:45.789Z] ✅ Success: https://api.example.com/data | Status: 200 | Duration: 333ms | Method: GET
-```
+Retained observability is disabled by default. Temporary live diagnostics are available with `npm run logs` or `npm run logs:json`. Application logs include blocked requests, backup selection, and upstream connection failures. Known secret-looking URL parameters are redacted, but arbitrary query values can still contain private data; avoid recording public traffic unnecessarily. Do not assume retained logging is always free on every account plan.
 
 ### Troubleshooting
 
@@ -442,8 +434,8 @@ fetch("https://your-worker.workers.dev/?url=https://api.example.com/resource/123
 - **URL Validation**: Validates and normalizes target URLs before making requests
 - **Request Body Forwarding**: Properly forwards request bodies for POST, PUT, PATCH, and other methods
 - **Streaming Responses**: Upstream bodies are streamed straight through (never buffered), so SSE, AI streaming APIs and large downloads work with low latency
-- **Backup CORS Failover**: Retries with backup CORS servers when direct requests fail or return retryable status (`403`, `429`, `502`, `503`)
-- **Backup Security Guard**: If request contains sensitive headers (`Authorization`, `Proxy-Authorization`, `X-API-Key`, `Api-Key`, `X-Auth-Token`, `X-Access-Token`), backup servers are skipped and only the direct target is used
+- **Backup CORS Failover**: Retries with backup CORS servers when direct requests fail or return retryable status (`403`, `502`, `503`) for GET/HEAD only
+- **Backup Security Guard**: If request contains sensitive headers (`Cookie`, `Authorization`, `Proxy-Authorization`, `X-API-Key`, `Api-Key`, `X-Auth-Token`, `X-Access-Token`), backup servers are skipped and only the direct target is used
   - Override: append `?allowSensitive=true` to allow backup usage even when sensitive headers exist
 - **All HTTP Methods**: Supports GET, POST, PUT, DELETE, PATCH, HEAD, and OPTIONS
 - **Preflight Caching**: Caches CORS preflight responses for 24 hours to reduce overhead
