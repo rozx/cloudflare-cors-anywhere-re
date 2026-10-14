@@ -47,7 +47,8 @@ export function getSensitiveHeadersForBackup(request, customHeaders) {
     const detectedHeaders = [];
 
     for (const [key] of request.headers.entries()) {
-        if (sensitiveHeaderNames.has(key.toLowerCase())) {
+        // The request's own Cookie is never forwarded (see buildUpstreamHeaders).
+        if (key.toLowerCase() !== "cookie" && sensitiveHeaderNames.has(key.toLowerCase())) {
             detectedHeaders.push(key);
         }
     }

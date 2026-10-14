@@ -500,3 +500,36 @@ test("self-proxy loops and WebSocket upgrades are rejected", async () => {
         assert.equal(calls.length, 0);
     }
 });
+
+test("proxy-domain cookies are not forwarded and do not block backup failover", async () => {
+    const { response, calls } = await run(
+        request(undefined, { headers: { Cookie: "proxy_site=private" } }),
+        {
+            ENABLE_BACKUP_FALLBACK: "true",
+            BACKUP_CORS_SERVERS: '["https://backup.example/?url={url}"]'
+        },
+        (_, n) => new Response("result", { status: n === 1 ? 403 : 200 })
+    );
+    assert.equal(response.status, 200);
+    assert.equal(calls.length, 2);
+    for (const call of calls) assert.equal(call.headers.get("cookie"), null);
+});
+
+test("target cookies sent via x-cors-headers are forwarded but never to backups", async () => {
+    const { response, calls } = await run(
+        request(undefined, {
+            headers: {
+                Cookie: "proxy_site=private",
+                "x-cors-headers": '{"Cookie":"over18=yes"}'
+            }
+        }),
+        {
+            ENABLE_BACKUP_FALLBACK: "true",
+            BACKUP_CORS_SERVERS: '["https://backup.example/?url={url}"]'
+        },
+        () => new Response("blocked", { status: 403 })
+    );
+    assert.equal(response.status, 403);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].headers.get("cookie"), "over18=yes");
+});

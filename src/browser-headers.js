@@ -120,15 +120,17 @@ export function buildUpstreamHeaders(request, targetUrl, customHeaders) {
     const upstreamHeaders = new Headers(
         getBrowserHeaders(targetUrl, request.headers.get("Origin"))
     );
-    const add = entries => {
+    const add = (entries, excluded) => {
         for (const [key, value] of entries) {
-            if (!EXCLUDED_HEADER_PATTERNS.some(pattern => pattern.test(key))) {
+            if (!excluded.some(pattern => pattern.test(key))) {
                 upstreamHeaders.set(key, value);
             }
         }
     };
-    add(request.headers);
-    if (customHeaders) add(Object.entries(customHeaders));
+    // A browser attaches the proxy domain's own cookies; they are never meant for the
+    // target. Target cookies must be sent explicitly through x-cors-headers.
+    add(request.headers, [...EXCLUDED_HEADER_PATTERNS, /^cookie$/i]);
+    if (customHeaders) add(Object.entries(customHeaders), EXCLUDED_HEADER_PATTERNS);
     upstreamHeaders.delete("connection");
     upstreamHeaders.set("x-cors-proxy-hop", "1");
     return upstreamHeaders;
