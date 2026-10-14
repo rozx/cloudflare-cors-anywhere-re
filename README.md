@@ -16,6 +16,8 @@ const text = await response.text();
 
 Use the target API's normal method, headers, and body for POST, PUT, PATCH, or DELETE requests. CORS preflights are handled automatically. The legacy `?{targetUrl}` format is also supported.
 
+The proxy sends a consistent browser identity upstream: the client's own `User-Agent`, `Sec-Ch-*`, `Sec-Fetch-*` and `Upgrade-Insecure-Requests` headers are not forwarded. To use a specific User-Agent, send it in the `x-cors-headers` JSON header (for example `{"User-Agent":"MyApp/1.0"}`); the browser identity headers are then omitted.
+
 ## Limits and costs
 
 | Limit | Default |

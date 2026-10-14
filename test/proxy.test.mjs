@@ -138,6 +138,46 @@ test("never forwards the client's IP upstream, even via x-cors-headers", async (
     }
 });
 
+test("keeps the browser fingerprint intact when the client sends its own identity", async () => {
+    const { calls } = await runWorker(
+        new Request(proxyUrl("https://direct.example/data"), {
+            headers: {
+                "User-Agent": "curl/8.7.1",
+                "Sec-Ch-Ua": '"Firefox";v="140"',
+                "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Dest": "empty",
+                Accept: "application/json"
+            }
+        }),
+        {},
+        () => new Response("ok")
+    );
+
+    const headers = calls[0].headers;
+    assert.match(headers.get("user-agent"), /^Mozilla\/5\.0 /);
+    assert.notEqual(headers.get("sec-ch-ua"), '"Firefox";v="140"');
+    assert.equal(headers.get("sec-fetch-mode"), "navigate");
+    assert.equal(headers.get("sec-fetch-dest"), "document");
+    // Non-identity headers still come from the client.
+    assert.equal(headers.get("accept"), "application/json");
+});
+
+test("a User-Agent set via x-cors-headers replaces the whole browser identity", async () => {
+    const { calls } = await runWorker(
+        new Request(proxyUrl("https://direct.example/data"), {
+            headers: { "x-cors-headers": '{"User-Agent":"MyApp/1.0"}' }
+        }),
+        {},
+        () => new Response("ok")
+    );
+
+    const headers = calls[0].headers;
+    assert.equal(headers.get("user-agent"), "MyApp/1.0");
+    for (const name of headers.keys()) {
+        assert.doesNotMatch(name, /^(sec-ch-|sec-fetch-|upgrade-insecure-requests$)/, name);
+    }
+});
+
 test("supports the legacy ?{targetUrl} format", async () => {
     const { response, calls } = await runWorker(
         new Request(`${WORKER_ORIGIN}/?https://legacy.example/path`),

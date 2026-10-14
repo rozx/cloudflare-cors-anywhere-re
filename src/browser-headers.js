@@ -19,6 +19,15 @@ const EXCLUDED_HEADER_PATTERNS = [
     /^(host|connection|content-length|transfer-encoding|upgrade|proxy-authorization|proxy-connection|keep-alive|te|trailer)$/i
 ];
 
+// Headers that make up the browser identity. They must agree with each other, so the
+// client's own values (e.g. curl's User-Agent) never mix into the fingerprint.
+const IDENTITY_HEADER_PATTERNS = [
+    /^user-agent$/i,
+    /^sec-ch-/i,
+    /^sec-fetch-/i,
+    /^upgrade-insecure-requests$/i
+];
+
 // Realistic browser fingerprints to rotate through.
 // Referer and Sec-Fetch-Site are filled in per request by getBrowserHeaders.
 const BROWSER_FINGERPRINTS = [
@@ -117,12 +126,20 @@ function getBrowserHeaders(targetUrl, originHeader) {
 
 /**
  * Build the upstream request headers: browser-like defaults, then the original request
- * headers (minus excluded ones), then x-cors-headers overrides.
+ * headers (minus excluded and identity ones), then x-cors-headers overrides.
  */
 export function buildUpstreamHeaders(request, targetUrl, customHeaders) {
     const upstreamHeaders = new Headers(
         getBrowserHeaders(targetUrl, request.headers.get("Origin"))
     );
+    // An explicit User-Agent replaces the whole fingerprint identity; any sec-* headers
+    // the caller wants must then come from x-cors-headers as well.
+    if (customHeaders && Object.keys(customHeaders).some(key => /^user-agent$/i.test(key))) {
+        for (const name of [...upstreamHeaders.keys()]) {
+            if (IDENTITY_HEADER_PATTERNS.some(pattern => pattern.test(name)))
+                upstreamHeaders.delete(name);
+        }
+    }
     const add = (entries, excluded) => {
         for (const [key, value] of entries) {
             if (!excluded.some(pattern => pattern.test(key))) {
@@ -132,7 +149,7 @@ export function buildUpstreamHeaders(request, targetUrl, customHeaders) {
     };
     // A browser attaches the proxy domain's own cookies; they are never meant for the
     // target. Target cookies must be sent explicitly through x-cors-headers.
-    add(request.headers, [...EXCLUDED_HEADER_PATTERNS, /^cookie$/i]);
+    add(request.headers, [...EXCLUDED_HEADER_PATTERNS, ...IDENTITY_HEADER_PATTERNS, /^cookie$/i]);
     if (customHeaders) add(Object.entries(customHeaders), EXCLUDED_HEADER_PATTERNS);
     upstreamHeaders.delete("connection");
     upstreamHeaders.set("x-cors-proxy-hop", "1");
