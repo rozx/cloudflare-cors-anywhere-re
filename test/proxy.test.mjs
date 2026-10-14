@@ -704,3 +704,23 @@ test("Accept and Accept-Language are part of the cache key", async () => {
         restore();
     }
 });
+
+test("Chrome fingerprints keep User-Agent and client hints on the same version", async () => {
+    const seen = new Set();
+    for (let i = 0; i < 40; i++) {
+        const { calls } = await runWorker(
+            new Request(proxyUrl(`https://fingerprint.example/${i}`)),
+            {},
+            () => new Response("ok")
+        );
+        const headers = calls[0].headers;
+        const chrome = headers.get("user-agent").match(/ Chrome\/(\d+)\.0\.0\.0 /);
+        if (!chrome) continue;
+        seen.add(headers.get("sec-ch-ua-platform"));
+        assert.match(headers.get("sec-ch-ua"), new RegExp(`"Google Chrome";v="${chrome[1]}"`));
+        assert.match(headers.get("sec-ch-ua"), new RegExp(`"Chromium";v="${chrome[1]}"`));
+        // High-entropy hints are only sent after the server asks for them via Accept-CH.
+        assert.equal(headers.get("sec-ch-ua-platform-version"), null);
+    }
+    assert.equal(seen.size, 2);
+});
