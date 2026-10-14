@@ -677,3 +677,30 @@ test("x-cors-headers is part of the cache key", async () => {
         restore();
     }
 });
+
+test("Accept and Accept-Language are part of the cache key", async () => {
+    const { restore } = withFakeCache();
+    try {
+        const target = "https://cache-negotiation.example/";
+        const fetchWith = async (headers, body) =>
+            runWorker(new Request(proxyUrl(target), { headers }), {}, () => new Response(body));
+
+        await fetchWith({ Accept: "*/*" }, "any");
+        for (const [headers, body] of [
+            [{ Accept: "application/json" }, "json"],
+            [{ Accept: "*/*", "Accept-Language": "ja" }, "ja"]
+        ]) {
+            const other = await fetchWith(headers, body);
+            assert.equal(other.calls.length, 1, JSON.stringify(headers));
+            assert.equal(other.response.headers.get("x-cors-cache"), "MISS");
+            assert.equal(await other.response.text(), body);
+        }
+
+        const repeat = await fetchWith({ Accept: "application/json" }, "unused");
+        assert.equal(repeat.calls.length, 0);
+        assert.equal(repeat.response.headers.get("x-cors-cache"), "HIT");
+        assert.equal(await repeat.response.text(), "json");
+    } finally {
+        restore();
+    }
+});

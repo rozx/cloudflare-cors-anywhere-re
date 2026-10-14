@@ -44,9 +44,15 @@ export function isCacheableRequest(request, sensitiveHeaders) {
 }
 
 // The key lives on our own origin and is hashed, so target query secrets are never stored
-// in it. x-cors-headers is part of the key because it changes the upstream request.
+// in it. x-cors-headers, Accept and Accept-Language are part of the key because they change
+// the upstream request and can change the response (content negotiation).
 export async function buildCacheKey(originUrl, targetUrl, request) {
-    const material = JSON.stringify([targetUrl, request.headers.get("x-cors-headers") || ""]);
+    const material = JSON.stringify([
+        targetUrl,
+        ...["x-cors-headers", "accept", "accept-language"].map(
+            name => request.headers.get(name) || ""
+        )
+    ]);
     const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(material));
     const hex = [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, "0")).join("");
     return new Request(`${originUrl.origin}/__cors-cache/${hex}`);
