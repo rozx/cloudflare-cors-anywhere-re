@@ -15,9 +15,10 @@ keep_vars = true  # Preserve remote environment variables from Cloudflare Dashbo
 # MAX_RETRY_ATTEMPTS = "0"
 
 
-# Public traffic must not generate retained logs or expose target query credentials.
-[observability]
-enabled = false
+# Observability is managed in the Cloudflare Dashboard. Defining it here overwrites
+# the Dashboard setting on every deploy. Logged URLs can carry target query credentials.
+# [observability]
+# enabled = false
 
 # Approximate limits per Cloudflare location. These are not billing caps.
 [[ratelimits]]
