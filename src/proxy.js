@@ -1,5 +1,9 @@
 // Bounded upstream forwarding: all redirects, retries and backups share one budget.
-import { clearPreferredBackupServer, setPreferredBackupServer } from "./backup-cache.js";
+import {
+    clearPreferredBackupServer,
+    getLocalPreferredBackupServer,
+    setPreferredBackupServer
+} from "./backup-cache.js";
 import { buildBackupAttemptTargets, getSensitiveHeadersForBackup } from "./backup-targets.js";
 import { buildUpstreamHeaders } from "./browser-headers.js";
 import { applyCorsHeaders } from "./cors.js";
@@ -53,6 +57,13 @@ export async function proxyRequest({
                     ...(await buildBackupAttemptTargets(cacheEnv, ctx, targetUrl, backupServers))
                 );
         };
+        // A fresh in-memory preference means direct recently failed and a backup worked:
+        // try backups first and keep direct as the last resort. Memory only, so a direct
+        // success never pays for a KV read; the mark expires or clears on backup failure.
+        if (backupServers.length && getLocalPreferredBackupServer(targetUrl)) {
+            await resolveBackups();
+            if (targets.some(target => target.preferred)) targets.push(targets.shift());
+        }
         const canRetry = (attemptIndex, status) =>
             canReplay &&
             budget.remaining > 0 &&
@@ -105,7 +116,8 @@ export async function proxyRequest({
                     void response.body?.cancel().catch(() => {});
                     continue;
                 }
-            } else if (target.mode === "backup" && response.ok) {
+            } else if (target.mode === "backup" && !target.preferred && response.ok) {
+                // Refreshing on preferred hits would keep skipping direct forever.
                 ctx.waitUntil(setPreferredBackupServer(cacheEnv, targetUrl, target.backupServer));
             }
 

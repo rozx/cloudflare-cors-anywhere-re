@@ -65,7 +65,7 @@ Set these environment variables in Cloudflare or in `wrangler.toml` under `[vars
 
 Origin rules are browser policy, not authentication: non-browser clients can spoof `Origin`. Invalid access rules fail closed. Change rate thresholds in the `[[ratelimits]]` sections; use namespace IDs unique to your account.
 
-Optional backup settings are defined in [src/config.js](src/config.js). Set `ENABLE_BACKUP_FALLBACK`, `ENABLE_BACKUP_KV` and `MAX_RETRY_ATTEMPTS` in the Cloudflare Dashboard, not in `wrangler.toml` `[vars]`, which would overwrite the Dashboard values on every deploy. With `ENABLE_BACKUP_FALLBACK = "true"`, blocked GET/HEAD requests (403/502/503) fail over to up to two `BACKUP_CORS_SERVERS`; each failover is an extra billable subrequest. Keep `ENABLE_BACKUP_KV` off for the public, free deployment.
+Optional backup settings are defined in [src/config.js](src/config.js). Set `ENABLE_BACKUP_FALLBACK`, `ENABLE_BACKUP_KV` and `MAX_RETRY_ATTEMPTS` in the Cloudflare Dashboard, not in `wrangler.toml` `[vars]`, which would overwrite the Dashboard values on every deploy. With `ENABLE_BACKUP_FALLBACK = "true"`, blocked GET/HEAD requests (403/502/503) fail over to up to two `BACKUP_CORS_SERVERS`; each failover is an extra billable subrequest. After a successful failover, that domain goes to the backup first for up to 15 minutes (per isolate, in memory), with direct as the last resort. Keep `ENABLE_BACKUP_KV` off for the public, free deployment.
 
 ## Development
 

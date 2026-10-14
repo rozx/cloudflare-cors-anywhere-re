@@ -433,3 +433,63 @@ test("returns 502 when every attempt fails with a network error", async () => {
     assert.equal(response.status, 502);
     assert.equal(calls.length, 2);
 });
+
+test("skips the direct attempt while a target is known to be blocked", async () => {
+    const env = {
+        ENABLE_BACKUP_FALLBACK: "true",
+        BACKUP_CORS_SERVERS: JSON.stringify(["https://backup-a.example/?url={url}"])
+    };
+    const target = "https://known-blocked.example/page";
+    const first = await runWorker(new Request(proxyUrl(target)), env, (request, n) =>
+        n === 1 ? new Response("blocked", { status: 403 }) : new Response("from-backup")
+    );
+    assert.equal(first.calls.length, 2);
+
+    const second = await runWorker(new Request(proxyUrl(target)), env, () => new Response("ok"));
+    assert.equal(second.response.status, 200);
+    assert.equal(second.calls.length, 1);
+    assert.match(second.calls[0].url, /^https:\/\/backup-a\.example\//);
+});
+
+test("falls back to direct when the preferred backup fails, then tries direct first", async () => {
+    const env = {
+        ENABLE_BACKUP_FALLBACK: "true",
+        BACKUP_CORS_SERVERS: JSON.stringify(["https://backup-a.example/?url={url}"])
+    };
+    const target = "https://unblocked-again.example/page";
+    await runWorker(new Request(proxyUrl(target)), env, (request, n) =>
+        n === 1 ? new Response("blocked", { status: 403 }) : new Response("from-backup")
+    );
+
+    const second = await runWorker(new Request(proxyUrl(target)), env, (request, n) =>
+        n === 1 ? new Response("down", { status: 503 }) : new Response("direct-ok")
+    );
+    assert.equal(second.response.status, 200);
+    assert.equal(await second.response.text(), "direct-ok");
+    assert.deepEqual(
+        second.calls.map(call => new URL(call.url).hostname),
+        ["backup-a.example", "unblocked-again.example"]
+    );
+
+    const third = await runWorker(new Request(proxyUrl(target)), env, () => new Response("ok"));
+    assert.equal(new URL(third.calls[0].url).hostname, "unblocked-again.example");
+});
+
+test("never skips direct for requests that cannot use backups", async () => {
+    const env = {
+        ENABLE_BACKUP_FALLBACK: "true",
+        BACKUP_CORS_SERVERS: JSON.stringify(["https://backup-a.example/?url={url}"])
+    };
+    const target = "https://blocked-post.example/api";
+    await runWorker(new Request(proxyUrl(target)), env, (request, n) =>
+        n === 1 ? new Response("blocked", { status: 403 }) : new Response("from-backup")
+    );
+
+    const post = await runWorker(
+        new Request(proxyUrl(target), { method: "POST", body: "x" }),
+        env,
+        () => new Response("ok")
+    );
+    assert.equal(post.calls.length, 1);
+    assert.equal(new URL(post.calls[0].url).hostname, "blocked-post.example");
+});

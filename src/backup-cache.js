@@ -90,6 +90,19 @@ function getLocalCacheWithStale(key) {
 }
 
 /**
+ * Fresh in-memory preferred backup only; never reads KV. A hit means this isolate
+ * recently saw the direct target fail and that backup succeed.
+ */
+export function getLocalPreferredBackupServer(targetUrl) {
+    try {
+        const entry = getLocalCacheWithStale(buildPreferredBackupCacheKey(targetUrl));
+        return entry && !entry.isStale && entry.value ? entry.value : null;
+    } catch {
+        return null;
+    }
+}
+
+/**
  * Get preferred backup server with stale-while-revalidate pattern.
  * Returns the preferred server template string or null.
  * Uses local cache as primary, KV as secondary.
