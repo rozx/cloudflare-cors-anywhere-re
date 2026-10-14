@@ -5,10 +5,14 @@ workers_dev = false
 preview_urls = false
 keep_vars = true  # Preserve remote environment variables from Cloudflare Dashboard
 
-[vars]
-ENABLE_BACKUP_FALLBACK = "false"
-ENABLE_BACKUP_KV = "false"
-MAX_RETRY_ATTEMPTS = "0"
+# Runtime settings live in the Cloudflare Dashboard. Do not add them to [vars]:
+# keep_vars only preserves Dashboard vars that this file does not define, so any
+# [vars] entry here overwrites the Dashboard value on every deploy.
+# Example values (unset means the safe default in src/config.js: off / 0):
+# [vars]
+# ENABLE_BACKUP_FALLBACK = "true"
+# ENABLE_BACKUP_KV = "false"
+# MAX_RETRY_ATTEMPTS = "0"
 
 
 # Public traffic must not generate retained logs or expose target query credentials.

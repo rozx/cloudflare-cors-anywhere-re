@@ -51,7 +51,7 @@ routes = [{ pattern = "cors.example.com", custom_domain = true }]
 npm run deploy
 ```
 
-Deployment reads the release version from `package.json`. Existing dashboard variables are preserved; the checked-in safety flags explicitly disable backups, KV, and retries.
+Deployment reads the release version from `package.json`. Dashboard variables are preserved because `wrangler.toml` defines no `[vars]`; when unset, backups, KV, and retries default to off.
 
 ## Configuration
 
@@ -65,7 +65,7 @@ Set these environment variables in Cloudflare or in `wrangler.toml` under `[vars
 
 Origin rules are browser policy, not authentication: non-browser clients can spoof `Origin`. Invalid access rules fail closed. Change rate thresholds in the `[[ratelimits]]` sections; use namespace IDs unique to your account.
 
-Optional backup settings are defined in [src/config.js](src/config.js). Keep `ENABLE_BACKUP_FALLBACK` and `ENABLE_BACKUP_KV` off for the public, free deployment.
+Optional backup settings are defined in [src/config.js](src/config.js). Set `ENABLE_BACKUP_FALLBACK`, `ENABLE_BACKUP_KV` and `MAX_RETRY_ATTEMPTS` in the Cloudflare Dashboard, not in `wrangler.toml` `[vars]`, which would overwrite the Dashboard values on every deploy. With `ENABLE_BACKUP_FALLBACK = "true"`, blocked GET/HEAD requests (403/502/503) fail over to up to two `BACKUP_CORS_SERVERS`; each failover is an extra billable subrequest. Keep `ENABLE_BACKUP_KV` off for the public, free deployment.
 
 ## Development
 
