@@ -15,10 +15,16 @@ keep_vars = true  # Preserve remote environment variables from Cloudflare Dashbo
 # MAX_RETRY_ATTEMPTS = "0"
 
 
-# Observability is managed in the Cloudflare Dashboard. Defining it here overwrites
-# the Dashboard setting on every deploy. Logged URLs can carry target query credentials.
-# [observability]
-# enabled = false
+# Observability must be defined here: unlike [vars] there is no keep option, and a
+# deploy without this section turns logs off. Dashboard changes are overwritten.
+# Logged URLs can carry target query credentials.
+[observability]
+enabled = true
+head_sampling_rate = 1
+
+[observability.logs]
+enabled = true
+invocation_logs = true
 
 # Approximate limits per Cloudflare location. These are not billing caps.
 [[ratelimits]]
