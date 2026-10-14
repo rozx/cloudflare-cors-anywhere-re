@@ -12,6 +12,9 @@ const EXCLUDED_HEADER_PATTERNS = [
     /^referer$/i,
     /^cf-/i,
     /^x-forw/i,
+    // Cloudflare sets x-real-ip on the incoming request and turns a forwarded one into the
+    // subrequest's X-Forwarded-For, which would leak the client's IP to the target.
+    /^(x-real-ip|true-client-ip|x-client-ip|x-cluster-client-ip|forwarded)$/i,
     /^x-cors-/i,
     /^(host|connection|content-length|transfer-encoding|upgrade|proxy-authorization|proxy-connection|keep-alive|te|trailer)$/i
 ];

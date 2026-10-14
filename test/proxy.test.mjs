@@ -115,6 +115,29 @@ test("proxies a direct request and adds CORS headers", async () => {
     assert.equal(calls[0].headers.get("origin"), null);
 });
 
+test("never forwards the client's IP upstream, even via x-cors-headers", async () => {
+    const ipHeaders = {
+        "x-real-ip": "198.51.100.7",
+        "true-client-ip": "198.51.100.7",
+        "x-client-ip": "198.51.100.7",
+        "x-cluster-client-ip": "198.51.100.7",
+        forwarded: "for=198.51.100.7",
+        "x-forwarded-for": "198.51.100.7"
+    };
+    const { response, calls } = await runWorker(
+        new Request(proxyUrl("https://direct.example/data"), {
+            headers: { ...ipHeaders, "x-cors-headers": JSON.stringify(ipHeaders) }
+        }),
+        {},
+        () => new Response("ok")
+    );
+
+    assert.equal(response.status, 200);
+    for (const name of Object.keys(ipHeaders)) {
+        assert.equal(calls[0].headers.get(name), null, name);
+    }
+});
+
 test("supports the legacy ?{targetUrl} format", async () => {
     const { response, calls } = await runWorker(
         new Request(`${WORKER_ORIGIN}/?https://legacy.example/path`),
