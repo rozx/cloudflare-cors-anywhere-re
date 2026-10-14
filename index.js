@@ -20,6 +20,7 @@ Module layout (src/):
   request-parsing.js  target URL extraction/validation, x-cors-headers parsing
   cors.js             whitelist/blacklist matching, CORS response headers
   proxy.js            upstream fetch with retries and backup failover
+  response-cache.js   10-minute edge cache for anonymous GET responses
   backup-targets.js   backup server ordering and URL building
   backup-cache.js     preferred backup server cache (memory + KV)
   browser-headers.js  browser fingerprint headers for upstream requests

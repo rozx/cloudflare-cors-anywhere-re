@@ -30,7 +30,7 @@ Rate limits are approximate and apply per Cloudflare location, not globally. HTT
 
 **For no Worker usage charges, keep the account on Workers Free.** Its 100,000-request daily quota is shared across the account. Abuse can exhaust that quota and cause downtime. Paid plans can incur usage charges; these rate limits are not a spending cap. See [Cloudflare's limits](https://developers.cloudflare.com/workers/platform/limits/).
 
-Backups, persistent KV caching, and automatic retries are disabled by default. Workers Logs are enabled in `wrangler.toml` and record target URLs, including query strings; set `[observability] enabled = false` to turn them off. Enabling a third-party backup can incur separate charges. Write requests are never replayed, and upstream 429 responses are never retried.
+Backups, persistent KV caching, and automatic retries are disabled by default. Anonymous GET responses with status 200 are cached for 10 minutes per Cloudflare location, keyed by target URL and `x-cors-headers`; requests with credentials or other custom headers bypass the cache. The `x-cors-cache` response header reports `HIT` or `MISS`. Workers Logs are enabled in `wrangler.toml` and record target URLs, including query strings; set `[observability] enabled = false` to turn them off. Enabling a third-party backup can incur separate charges. Write requests are never replayed, and upstream 429 responses are never retried.
 
 ## Deploy your own
 

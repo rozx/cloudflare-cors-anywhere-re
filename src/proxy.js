@@ -14,10 +14,54 @@ import {
     limitResponseBody,
     ProxyLimitError
 } from "./request-budget.js";
+import {
+    buildCacheKey,
+    isCacheableRequest,
+    matchCachedResponse,
+    putCachedResponse
+} from "./response-cache.js";
 import { errorResponse, isAllowedTarget } from "./security.js";
 import { fetchWithPolicy } from "./upstream-fetch.js";
 
 const RETRYABLE_STATUS_CODES = new Set([403, 502, 503]);
+
+// Untrusted upstream content must not set cookies or execute on the proxy origin.
+const STRIPPED_RESPONSE_HEADERS = [
+    "set-cookie",
+    "set-cookie2",
+    "clear-site-data",
+    "service-worker-allowed",
+    "nel",
+    "report-to",
+    "reporting-endpoints",
+    "refresh",
+    "alt-svc"
+];
+
+function sanitizeUpstreamHeaders(upstreamHeaders) {
+    const headers = new Headers(upstreamHeaders);
+    for (const name of STRIPPED_RESPONSE_HEADERS) headers.delete(name);
+    return headers;
+}
+
+// `upstream` is a fresh or cached upstream response whose headers are already sanitized.
+function buildClientResponse(request, upstream, body, cacheStatus) {
+    const responseHeaders = new Headers(upstream.headers);
+    const receivedHeaders = Object.fromEntries(responseHeaders.entries());
+    applyCorsHeaders(responseHeaders, request);
+    const exposedHeaders = [...Object.keys(receivedHeaders), "cors-received-headers"];
+    if (cacheStatus) {
+        responseHeaders.set("x-cors-cache", cacheStatus);
+        exposedHeaders.push("x-cors-cache");
+    }
+    responseHeaders.set("Access-Control-Expose-Headers", exposedHeaders.join(","));
+    responseHeaders.set("cors-received-headers", JSON.stringify(receivedHeaders));
+    return new Response(body, {
+        headers: responseHeaders,
+        status: upstream.status,
+        statusText: upstream.statusText
+    });
+}
 
 export async function proxyRequest({
     request,
@@ -37,6 +81,13 @@ export async function proxyRequest({
         // Even nominally idempotent writes can trigger billable work. Never replay them.
         const canReplay = ["GET", "HEAD"].includes(request.method);
         const sensitiveHeaders = getSensitiveHeadersForBackup(request, customHeaders);
+        const cacheKey = isCacheableRequest(request, sensitiveHeaders)
+            ? await buildCacheKey(originUrl, targetUrl, request)
+            : null;
+        if (cacheKey) {
+            const cached = await matchCachedResponse(cacheKey);
+            if (cached) return buildClientResponse(request, cached, cached.body, "HIT");
+        }
         const allowSensitive = originUrl.searchParams.get("allowSensitive") === "true";
         const backupServers =
             canReplay && (!sensitiveHeaders.length || allowSensitive)
@@ -121,33 +172,32 @@ export async function proxyRequest({
                 ctx.waitUntil(setPreferredBackupServer(cacheEnv, targetUrl, target.backupServer));
             }
 
-            const responseHeaders = new Headers(response.headers);
-            // Untrusted upstream content must not set cookies or execute on the proxy origin.
-            for (const name of [
-                "set-cookie",
-                "set-cookie2",
-                "clear-site-data",
-                "service-worker-allowed",
-                "nel",
-                "report-to",
-                "reporting-endpoints",
-                "refresh",
-                "alt-svc"
-            ])
-                responseHeaders.delete(name);
-            const receivedHeaders = Object.fromEntries(responseHeaders.entries());
-            applyCorsHeaders(responseHeaders, request);
-            responseHeaders.set(
-                "Access-Control-Expose-Headers",
-                [...Object.keys(receivedHeaders), "cors-received-headers"].join(",")
+            const upstreamHeaders = sanitizeUpstreamHeaders(response.headers);
+            let responseBody = limitResponseBody(response, budget);
+            if (cacheKey && response.status === 200 && responseBody) {
+                const [clientBody, cacheBody] = responseBody.tee();
+                responseBody = clientBody;
+                ctx.waitUntil(
+                    putCachedResponse(
+                        cacheKey,
+                        new Response(cacheBody, {
+                            status: 200,
+                            statusText: response.statusText,
+                            headers: upstreamHeaders
+                        })
+                    )
+                );
+            }
+            const result = buildClientResponse(
+                request,
+                {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: upstreamHeaders
+                },
+                responseBody,
+                cacheKey ? "MISS" : null
             );
-            responseHeaders.set("cors-received-headers", JSON.stringify(receivedHeaders));
-            const responseBody = limitResponseBody(response, budget);
-            const result = new Response(responseBody, {
-                headers: responseHeaders,
-                status: response.status,
-                statusText: response.statusText
-            });
             streaming = Boolean(responseBody);
             return result;
         }

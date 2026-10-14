@@ -493,3 +493,124 @@ test("never skips direct for requests that cannot use backups", async () => {
     assert.equal(post.calls.length, 1);
     assert.equal(new URL(post.calls[0].url).hostname, "blocked-post.example");
 });
+
+function withFakeCache() {
+    const store = new Map();
+    const cache = {
+        puts: 0,
+        async match(key) {
+            const entry = store.get(key.url);
+            return entry ? new Response(entry.body, entry.init) : undefined;
+        },
+        async put(key, response) {
+            cache.puts++;
+            store.set(key.url, {
+                body: await response.text(),
+                init: {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: [...response.headers]
+                }
+            });
+        }
+    };
+    const original = globalThis.caches;
+    globalThis.caches = { default: cache };
+    return { cache, store, restore: () => (globalThis.caches = original) };
+}
+
+test("caches anonymous GET 200 responses and serves repeats from cache", async () => {
+    const { cache, store, restore } = withFakeCache();
+    try {
+        const target = "https://cached.example/chapter?token=secret";
+        const first = await runWorker(
+            new Request(proxyUrl(target), { headers: { Origin: "https://app.example" } }),
+            {},
+            () =>
+                new Response("chapter", {
+                    headers: { "Cache-Control": "no-store", "Content-Type": "text/html" }
+                })
+        );
+        assert.equal(first.response.headers.get("x-cors-cache"), "MISS");
+        assert.equal(await first.response.text(), "chapter");
+        assert.equal(cache.puts, 1);
+        const [key] = store.keys();
+        assert.match(key, /^https:\/\/worker\.example\/__cors-cache\/[0-9a-f]{64}$/);
+
+        const second = await runWorker(
+            new Request(proxyUrl(target), { headers: { Origin: "https://other.example" } }),
+            {},
+            () => new Response("should not be fetched")
+        );
+        assert.equal(second.calls.length, 0);
+        assert.equal(second.response.headers.get("x-cors-cache"), "HIT");
+        assert.equal(await second.response.text(), "chapter");
+        assert.equal(
+            second.response.headers.get("access-control-allow-origin"),
+            "https://other.example"
+        );
+        assert.equal(second.response.headers.get("cache-control"), "no-store");
+        assert.equal(
+            JSON.parse(second.response.headers.get("cors-received-headers"))["cache-control"],
+            "no-store"
+        );
+        assert.match(second.response.headers.get("access-control-expose-headers"), /x-cors-cache/);
+    } finally {
+        restore();
+    }
+});
+
+test("does not cache errors, writes, or requests that may carry credentials", async () => {
+    const { cache, restore } = withFakeCache();
+    try {
+        await runWorker(
+            new Request(proxyUrl("https://cache-error.example/")),
+            {},
+            () => new Response("blocked", { status: 403 })
+        );
+        await runWorker(
+            new Request(proxyUrl("https://cache-post.example/"), { method: "POST", body: "x" }),
+            {},
+            () => new Response("ok")
+        );
+        for (const headers of [
+            { Authorization: "Bearer secret" },
+            { "x-goog-api-key": "secret" },
+            { "x-cors-headers": '{"Cookie":"over18=yes"}' },
+            { Range: "bytes=0-10" }
+        ]) {
+            const { response } = await runWorker(
+                new Request(proxyUrl("https://cache-private.example/"), { headers }),
+                {},
+                () => new Response("private")
+            );
+            assert.equal(response.headers.get("x-cors-cache"), null);
+        }
+        assert.equal(cache.puts, 0);
+    } finally {
+        restore();
+    }
+});
+
+test("x-cors-headers is part of the cache key", async () => {
+    const { restore } = withFakeCache();
+    try {
+        const target = "https://cache-variant.example/";
+        await runWorker(
+            new Request(proxyUrl(target), {
+                headers: { "x-cors-headers": '{"Accept-Language":"ja"}' }
+            }),
+            {},
+            () => new Response("ja")
+        );
+        const other = await runWorker(
+            new Request(proxyUrl(target)),
+            {},
+            () => new Response("default")
+        );
+        assert.equal(other.calls.length, 1);
+        assert.equal(await other.response.text(), "default");
+    } finally {
+        restore();
+    }
+});
