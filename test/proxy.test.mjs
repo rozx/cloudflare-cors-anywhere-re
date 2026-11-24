@@ -655,6 +655,28 @@ test("does not cache errors, writes, or requests that may carry credentials", as
     }
 });
 
+test("does not cache event streams, so a repeat gets live events", async () => {
+    const { cache, restore } = withFakeCache();
+    try {
+        const target = "https://events.example/feed";
+        for (const [contentType, event] of [
+            ["text/event-stream", "data: first\n\n"],
+            ["Text/Event-Stream; charset=utf-8", "data: second\n\n"]
+        ]) {
+            const { response, calls } = await runWorker(
+                new Request(proxyUrl(target)),
+                {},
+                () => new Response(event, { headers: { "Content-Type": contentType } })
+            );
+            assert.equal(calls.length, 1);
+            assert.equal(await response.text(), event);
+        }
+        assert.equal(cache.puts, 0);
+    } finally {
+        restore();
+    }
+});
+
 test("x-cors-headers is part of the cache key", async () => {
     const { restore } = withFakeCache();
     try {

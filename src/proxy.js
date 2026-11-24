@@ -17,6 +17,7 @@ import {
 import {
     buildCacheKey,
     isCacheableRequest,
+    isCacheableResponse,
     matchCachedResponse,
     putCachedResponse
 } from "./response-cache.js";
@@ -178,7 +179,7 @@ export async function proxyRequest({
 
             const upstreamHeaders = sanitizeUpstreamHeaders(response.headers);
             let responseBody = limitResponseBody(response, budget);
-            if (cacheKey && response.status === 200 && responseBody) {
+            if (cacheKey && isCacheableResponse(response) && responseBody) {
                 const [clientBody, cacheBody] = responseBody.tee();
                 responseBody = clientBody;
                 ctx.waitUntil(

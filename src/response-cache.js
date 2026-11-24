@@ -43,6 +43,13 @@ export function isCacheableRequest(request, sensitiveHeaders) {
     return true;
 }
 
+// A live event stream is not a document: a stored copy would replay stale events to later
+// callers, and an endless one never finishes storing.
+export function isCacheableResponse(response) {
+    const type = (response.headers.get("content-type") || "").trim().toLowerCase();
+    return response.status === 200 && !type.startsWith("text/event-stream");
+}
+
 // The key lives on our own origin and is hashed, so target query secrets are never stored
 // in it. x-cors-headers, Accept and Accept-Language are part of the key because they change
 // the upstream request and can change the response (content negotiation).
