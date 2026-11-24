@@ -6,27 +6,41 @@
 // 2. Using official APIs when available
 // 3. Deploying on platforms that support headless browsers (Vercel, AWS Lambda, etc.)
 
-// Request headers that must not be forwarded upstream
-const EXCLUDED_HEADER_PATTERNS = [
-    /^origin$/i,
-    /^referer$/i,
-    /^cf-/i,
-    /^x-forw/i,
+// Request headers that must not be forwarded upstream. Names are matched in lower case.
+const EXCLUDED_HEADER_NAMES = new Set([
+    "origin",
+    "referer",
     // Cloudflare sets x-real-ip on the incoming request and turns a forwarded one into the
     // subrequest's X-Forwarded-For, which would leak the client's IP to the target.
-    /^(x-real-ip|true-client-ip|x-client-ip|x-cluster-client-ip|forwarded)$/i,
-    /^x-cors-/i,
-    /^(host|connection|content-length|transfer-encoding|upgrade|proxy-authorization|proxy-connection|keep-alive|te|trailer)$/i
-];
+    "x-real-ip",
+    "true-client-ip",
+    "x-client-ip",
+    "x-cluster-client-ip",
+    "forwarded",
+    "host",
+    "connection",
+    "content-length",
+    "transfer-encoding",
+    "upgrade",
+    "proxy-authorization",
+    "proxy-connection",
+    "keep-alive",
+    "te",
+    "trailer"
+]);
+const EXCLUDED_HEADER_PREFIXES = ["cf-", "x-forw", "x-cors-"];
 
 // Headers that make up the browser identity. They must agree with each other, so the
 // client's own values (e.g. curl's User-Agent) never mix into the fingerprint.
-const IDENTITY_HEADER_PATTERNS = [
-    /^user-agent$/i,
-    /^sec-ch-/i,
-    /^sec-fetch-/i,
-    /^upgrade-insecure-requests$/i
-];
+const IDENTITY_HEADER_NAMES = new Set(["user-agent", "upgrade-insecure-requests"]);
+const IDENTITY_HEADER_PREFIXES = ["sec-ch-", "sec-fetch-"];
+
+const isExcludedHeader = name =>
+    EXCLUDED_HEADER_NAMES.has(name) ||
+    EXCLUDED_HEADER_PREFIXES.some(prefix => name.startsWith(prefix));
+const isIdentityHeader = name =>
+    IDENTITY_HEADER_NAMES.has(name) ||
+    IDENTITY_HEADER_PREFIXES.some(prefix => name.startsWith(prefix));
 
 // Realistic browser fingerprints to rotate through.
 // Chrome's Sec-Ch-Ua GREASE brand and order depend on the major version (Chromium's
@@ -132,23 +146,22 @@ export function buildUpstreamHeaders(request, targetUrl, customHeaders) {
     );
     // An explicit User-Agent replaces the whole fingerprint identity; any sec-* headers
     // the caller wants must then come from x-cors-headers as well.
-    if (customHeaders && Object.keys(customHeaders).some(key => /^user-agent$/i.test(key))) {
+    const customEntries = customHeaders ? Object.entries(customHeaders) : [];
+    if (customEntries.some(([key]) => key.toLowerCase() === "user-agent")) {
         for (const name of [...upstreamHeaders.keys()]) {
-            if (IDENTITY_HEADER_PATTERNS.some(pattern => pattern.test(name)))
-                upstreamHeaders.delete(name);
+            if (isIdentityHeader(name)) upstreamHeaders.delete(name);
         }
     }
-    const add = (entries, excluded) => {
-        for (const [key, value] of entries) {
-            if (!excluded.some(pattern => pattern.test(key))) {
-                upstreamHeaders.set(key, value);
-            }
-        }
-    };
     // A browser attaches the proxy domain's own cookies; they are never meant for the
     // target. Target cookies must be sent explicitly through x-cors-headers.
-    add(request.headers, [...EXCLUDED_HEADER_PATTERNS, ...IDENTITY_HEADER_PATTERNS, /^cookie$/i]);
-    if (customHeaders) add(Object.entries(customHeaders), EXCLUDED_HEADER_PATTERNS);
+    // Header iteration yields lower-case names.
+    for (const [name, value] of request.headers) {
+        if (!isExcludedHeader(name) && !isIdentityHeader(name) && name !== "cookie")
+            upstreamHeaders.set(name, value);
+    }
+    for (const [key, value] of customEntries) {
+        if (!isExcludedHeader(key.toLowerCase())) upstreamHeaders.set(key, value);
+    }
     upstreamHeaders.delete("connection");
     upstreamHeaders.set("x-cors-proxy-hop", "1");
     return upstreamHeaders;

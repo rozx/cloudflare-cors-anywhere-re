@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createRequestBudget, readRequestBody, limitResponseBody } from "../src/request-budget.js";
+import { MAX_DURATION_MS } from "../src/security.js";
 
 test("deadline cancels a stalled response even when nobody reads it", async t => {
     t.mock.timers.enable({ apis: ["setTimeout"] });
@@ -16,7 +17,7 @@ test("deadline cancels a stalled response even when nobody reads it", async t =>
         ),
         budget
     );
-    t.mock.timers.tick(30_001);
+    t.mock.timers.tick(MAX_DURATION_MS + 1);
     await assert.rejects(new Response(stream).text(), /timed out/);
     assert.equal(cancelled, true);
     assert.equal(budget.signal.aborted, true);
@@ -36,7 +37,7 @@ test("deadline interrupts a stalled upload before fetching", async t => {
     });
     const budget = createRequestBudget(req);
     const body = readRequestBody(req, budget);
-    t.mock.timers.tick(30_001);
+    t.mock.timers.tick(MAX_DURATION_MS + 1);
     await assert.rejects(body, /timed out/);
     assert.equal(cancelled, true);
     budget.close();

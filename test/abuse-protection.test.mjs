@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import worker from "../index.js";
+import { MAX_DURATION_MS } from "../src/security.js";
 
 const responses = [];
 test.afterEach(async () => {
@@ -436,7 +437,11 @@ test("upstream responses cannot modify the proxy origin or run scripts", async (
     assert.doesNotMatch(response.headers.get("cors-received-headers"), /stolen/);
 });
 
-test("chunked response size is enforced and the upstream stream is cancelled", async () => {
+// Counting response bytes means running JS for every chunk, which exhausts the Workers
+// Free CPU allowance on token-by-token streams. A response without a declared length is
+// therefore piped natively and bounded by the request deadline instead.
+test("an undeclared-length response is bounded by the deadline and then cancelled", async t => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
     let cancelled = false;
     const { response } = await run(
         request(),
@@ -453,8 +458,47 @@ test("chunked response size is enforced and the upstream stream is cancelled", a
                 })
             )
     );
-    await assert.rejects(response.arrayBuffer(), /Body size limit exceeded/);
+    const reader = response.body.getReader();
+    let received = 0;
+    while (received <= 10 * 1024 * 1024) received += (await reader.read()).value.byteLength;
+    t.mock.timers.tick(MAX_DURATION_MS + 1);
+    await assert.rejects(async () => {
+        for (;;) await reader.read();
+    }, /timed out/);
     assert.equal(cancelled, true);
+});
+
+test("an upload with a declared length is forwarded as a stream, not buffered", async () => {
+    let finishUpload;
+    let uploadFinished = false;
+    let fetchedBeforeUploadFinished = false;
+    const { response, calls } = await run(
+        request(undefined, {
+            method: "POST",
+            duplex: "half",
+            headers: { "Content-Length": "11", "Content-Type": "text/plain" },
+            body: new ReadableStream({
+                start(controller) {
+                    controller.enqueue(new TextEncoder().encode("hello "));
+                    finishUpload = () => {
+                        uploadFinished = true;
+                        controller.enqueue(new TextEncoder().encode("world"));
+                        controller.close();
+                    };
+                }
+            })
+        }),
+        {},
+        async upstream => {
+            fetchedBeforeUploadFinished = !uploadFinished;
+            finishUpload();
+            return new Response(await upstream.text());
+        }
+    );
+    assert.equal(fetchedBeforeUploadFinished, true);
+    assert.equal(await response.text(), "hello world");
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].headers.get("content-type"), "text/plain");
 });
 
 test("declared oversized response is rejected before streaming", async () => {

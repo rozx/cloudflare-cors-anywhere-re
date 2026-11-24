@@ -3,7 +3,9 @@ import { applyCorsHeaders, matchesPatternList } from "./cors.js";
 export const MAX_URL_LENGTH = 8192;
 export const MAX_REQUEST_BYTES = 1024 * 1024;
 export const MAX_RESPONSE_BYTES = 10 * 1024 * 1024;
-export const MAX_DURATION_MS = 30_000;
+// Long enough for a complete LLM generation, streamed or not. Bodies are piped natively,
+// so a long-lived request costs no CPU while it waits.
+export const MAX_DURATION_MS = 10 * 60_000;
 export const MAX_UPSTREAM_FETCHES = 3;
 export const ALLOWED_METHODS = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
 

@@ -33,29 +33,30 @@ function getNextBackupRotationStart(totalServers) {
     return startIndex;
 }
 
-export function getSensitiveHeadersForBackup(request, customHeaders) {
-    const sensitiveHeaderNames = new Set([
-        "cookie",
-        "authorization",
-        "proxy-authorization",
-        "x-api-key",
-        "api-key",
-        "x-auth-token",
-        "x-access-token"
-    ]);
+const SENSITIVE_HEADER_NAMES = new Set([
+    "cookie",
+    "authorization",
+    "proxy-authorization",
+    "x-api-key",
+    "api-key",
+    "x-auth-token",
+    "x-access-token"
+]);
 
+export function getSensitiveHeadersForBackup(request, customHeaders) {
     const detectedHeaders = [];
 
-    for (const [key] of request.headers.entries()) {
+    // Header iteration yields lower-case names.
+    for (const [key] of request.headers) {
         // The request's own Cookie is never forwarded (see buildUpstreamHeaders).
-        if (key.toLowerCase() !== "cookie" && sensitiveHeaderNames.has(key.toLowerCase())) {
+        if (key !== "cookie" && SENSITIVE_HEADER_NAMES.has(key)) {
             detectedHeaders.push(key);
         }
     }
 
     if (customHeaders && typeof customHeaders === "object") {
         for (const key of Object.keys(customHeaders)) {
-            if (sensitiveHeaderNames.has(String(key).toLowerCase())) {
+            if (SENSITIVE_HEADER_NAMES.has(String(key).toLowerCase())) {
                 detectedHeaders.push(key);
             }
         }

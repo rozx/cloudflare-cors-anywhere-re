@@ -22,13 +22,14 @@ The proxy sends a consistent browser identity upstream: the client's own `User-A
 
 | Limit | Default |
 | --- | --- |
-| Upload / response | 1 MiB / 10 MiB |
-| Total duration, including streaming | 30 seconds |
+| Upload | 1 MiB |
+| Response with a declared `Content-Length` | 10 MiB |
+| Total duration, including streaming | 10 minutes |
 | Requests per client | 60/minute per IPv4 address or IPv6 /64 |
 | Requests shared across clients | 300/minute |
 | Upstream calls, including redirects | 3 per request |
 
-Rate limits are approximate and apply per Cloudflare location, not globally. HTTP 429 means retry later; follow the `Retry-After` header. Oversized or slow responses may end early. Only HTTP(S) domains on standard ports are accepted; IP literals and obvious local targets are blocked.
+Rate limits are approximate and apply per Cloudflare location, not globally. HTTP 429 means retry later; follow the `Retry-After` header. Oversized or slow responses may end early. Responses without a `Content-Length`, such as Server-Sent Events, are streamed without being counted and end at the duration limit: counting them would run JavaScript for every chunk and exceed the 10 ms CPU allowance of Workers Free on long streams. Only HTTP(S) domains on standard ports are accepted; IP literals and obvious local targets are blocked.
 
 **For no Worker usage charges, keep the account on Workers Free.** Its 100,000-request daily quota is shared across the account. Abuse can exhaust that quota and cause downtime. Paid plans can incur usage charges; these rate limits are not a spending cap. See [Cloudflare's limits](https://developers.cloudflare.com/workers/platform/limits/).
 

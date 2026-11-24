@@ -40,8 +40,9 @@ export function createRequestBudget(request, durationMs = MAX_DURATION_MS) {
     };
 }
 
-// Limit actual bytes, including chunked bodies or dishonest Content-Length headers.
-// This is pull-driven so the response stays streamed with bounded buffering.
+// Count actual bytes in JS, for bodies whose length is not declared up front.
+// This is pull-driven so buffering stays bounded. Every chunk costs CPU, so it is used
+// only where nothing else bounds the body (see readRequestBody).
 export function boundedStream(body, maxBytes, signal, onDone = () => {}, status = 502) {
     if (!body) {
         onDone();
@@ -99,21 +100,46 @@ export function boundedStream(body, maxBytes, signal, onDone = () => {}, status 
     );
 }
 
+// Workers Free allows 10 ms of CPU per request, and every chunk that passes through a JS
+// stream costs CPU. Bodies are therefore handed to the runtime to pump natively wherever
+// their size can be bounded without reading them.
+
+// With a declared Content-Length the HTTP framing already bounds the body, so the native
+// stream is forwarded untouched. Without one the body is buffered and counted in JS.
 export async function readRequestBody(request, budget) {
-    if (Number(request.headers.get("content-length")) > MAX_REQUEST_BYTES) {
+    const declared = request.headers.get("content-length");
+    if (Number(declared) > MAX_REQUEST_BYTES) {
         void request.body?.cancel().catch(() => {});
         throw new ProxyLimitError("Request body too large", 413);
     }
     if (!request.body) return null;
+    if (declared !== null && /^\d+$/.test(declared)) return request.body;
     return new Response(
         boundedStream(request.body, MAX_REQUEST_BYTES, budget.signal, () => {}, 413)
     ).arrayBuffer();
 }
 
+// Workers' IdentityTransformStream is pumped by the runtime without entering JS; the
+// standard TransformStream is the equivalent elsewhere (Node tests).
+function createPassThrough() {
+    return typeof IdentityTransformStream === "function"
+        ? new IdentityTransformStream()
+        : new TransformStream();
+}
+
+// A declared length over the limit is rejected up front. The stream itself is not
+// counted: it is piped natively and ends when the upstream ends, the client disconnects
+// or the request deadline aborts the budget signal, whichever comes first.
 export function limitResponseBody(response, budget) {
     if (Number(response.headers.get("content-length")) > MAX_RESPONSE_BYTES) {
         void response.body?.cancel().catch(() => {});
         throw new ProxyLimitError("Response body too large");
     }
-    return boundedStream(response.body, MAX_RESPONSE_BYTES, budget.signal, () => budget.close());
+    if (!response.body) return null;
+    const { readable, writable } = createPassThrough();
+    response.body
+        .pipeTo(writable, { signal: budget.signal })
+        .catch(() => {})
+        .finally(() => budget.close());
+    return readable;
 }

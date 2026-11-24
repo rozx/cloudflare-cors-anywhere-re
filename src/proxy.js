@@ -123,12 +123,14 @@ export async function proxyRequest({
 
         for (let attemptIndex = 0; ; attemptIndex++) {
             const target = targets[Math.min(attemptIndex, targets.length - 1)];
-            const attemptHeaders = new Headers(headers);
+            // `headers` already carries x-cors-proxy-hop; only a backup needs its own copy.
+            let attemptHeaders = headers;
             if (target.backupHeaders) {
+                attemptHeaders = new Headers(headers);
                 for (const [name, value] of Object.entries(target.backupHeaders))
                     attemptHeaders.set(name, value);
+                attemptHeaders.set("x-cors-proxy-hop", "1");
             }
-            attemptHeaders.set("x-cors-proxy-hop", "1");
             if (target.mode === "backup")
                 console.log(`Using backup server: ${sanitizeUrlForLog(target.backupServer)}`);
             if (attemptIndex >= targets.length)
@@ -141,6 +143,8 @@ export async function proxyRequest({
                         method: request.method,
                         headers: attemptHeaders,
                         body,
+                        // The Fetch standard requires this for stream bodies; Workers ignores it.
+                        ...(body instanceof ReadableStream ? { duplex: "half" } : {}),
                         redirect: "manual",
                         signal: budget.signal
                     }),

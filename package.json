@@ -1,6 +1,6 @@
 {
     "name": "cloudflare-cors-anywhere",
-    "version": "1.3.16",
+    "version": "1.3.17",
     "description": "A CORS proxy running as a Cloudflare Worker",
     "main": "index.js",
     "scripts": {
